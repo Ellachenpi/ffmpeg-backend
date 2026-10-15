@@ -8,5 +8,6 @@ COPY package*.json ./
 RUN npm install
 COPY . .
 
-EXPOSE 3000
-CMD ["npm", "start"]
+EXPOSE 10000
+# 關鍵修正：直接用 node 啟動，不要透過 npm start
+CMD ["node", "server.js"]
