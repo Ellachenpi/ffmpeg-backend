@@ -8,17 +8,13 @@ const path = require('path');
 const app = express();
 app.use(cors());
 
-// 確保 uploads 暫存資料夾存在
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
 }
 
-// 修正：強制改用安全純英文檔名，避免中文亂碼造成 FFmpeg 解析失敗
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, uploadDir);
-    },
+    destination: (req, file, cb) => cb(null, uploadDir),
     filename: (req, file, cb) => {
         const ext = path.extname(file.originalname) || (file.fieldname === 'image' ? '.jpg' : '.mp3');
         cb(null, `${file.fieldname}_${Date.now()}${ext}`);
@@ -28,9 +24,8 @@ const storage = multer.diskStorage({
 const upload = multer({ storage: storage });
 
 app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req, res) => {
-    // 延長 HTTP 超時時間至 20 分鐘
-    req.setTimeout(1200000);
-    res.setTimeout(1200000);
+    req.setTimeout(1800000); // 30 分鐘超時防護
+    res.setTimeout(1800000);
 
     try {
         if (!req.files || !req.files['image'] || !req.files['audio']) {
@@ -43,7 +38,7 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
 
         const outputPath = path.join(uploadDir, `output_${Date.now()}.mp4`);
 
-        console.log(`[開始壓碼] 圖片路徑: ${imageFile.path}, 音檔路徑: ${audioFile.path}, 強化選項: ${enhanceType}`);
+        console.log(`[開始壓碼] 圖片: ${imageFile.path}, 音檔: ${audioFile.path}, 強化: ${enhanceType}`);
 
         let command = ffmpeg()
             .input(imageFile.path)
@@ -51,7 +46,7 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
             .input(audioFile.path)
             .videoCodec('libx264')
             .size('1280x720')
-            .fps(1) // 穩定 1 fps
+            .fps(1)
             .outputOptions([
                 '-preset ultrafast',
                 '-tune stillimage',
@@ -61,18 +56,12 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
                 '-movflags +faststart'
             ]);
 
-        // 聲音處理選項
         if (enhanceType === 'none') {
-            // 原始音效：直接複製音訊流 (c:a copy)，極速且音質無損
             command.audioCodec('copy');
         } else if (enhanceType === 'boost') {
-            // 音量清晰提升
-            command.audioCodec('aac')
-                   .audioBitrate('128k')
-                   .audioFilters('volume=1.4,highpass=f=80');
+            command.audioCodec('aac').audioBitrate('128k').audioFilters('volume=1.4,highpass=f=80');
         } else if (enhanceType === 'denoise') {
-            // 消除低頻雜音
-            command.audioFilters('highpass=f=120,volume=1.3');
+            command.audioCodec('aac').audioBitrate('128k').audioFilters('highpass=f=120,volume=1.3');
         }
 
         command
@@ -82,8 +71,20 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
                 }
             })
             .on('end', () => {
-                console.log('[壓碼成功] 正在傳送影片回前端...');
-                res.download(outputPath, 'output.mp4', () => {
+                console.log('[壓碼成功] 開始以 Stream 串流傳送影片回前端...');
+                
+                const stat = fs.statSync(outputPath);
+                res.writeHead(200, {
+                    'Content-Type': 'video/mp4',
+                    'Content-Length': stat.size,
+                    'Content-Disposition': 'attachment; filename="output.mp4"'
+                });
+
+                const readStream = fs.createReadStream(outputPath);
+                readStream.pipe(res);
+
+                readStream.on('close', () => {
+                    console.log('[傳輸完成] 清理暫存檔案...');
                     if (fs.existsSync(imageFile.path)) fs.unlinkSync(imageFile.path);
                     if (fs.existsSync(audioFile.path)) fs.unlinkSync(audioFile.path);
                     if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
@@ -91,7 +92,7 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
             })
             .on('error', (err) => {
                 console.error('[FFmpeg 錯誤]:', err);
-                res.status(500).send('轉碼失敗：' + err.message);
+                if (!res.headersSent) res.status(500).send('轉碼失敗：' + err.message);
                 if (fs.existsSync(imageFile.path)) fs.unlinkSync(imageFile.path);
                 if (fs.existsSync(audioFile.path)) fs.unlinkSync(audioFile.path);
                 if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
@@ -100,7 +101,7 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
 
     } catch (err) {
         console.error('[伺服器例外錯誤]:', err);
-        res.status(500).send('伺服器錯誤：' + err.message);
+        if (!res.headersSent) res.status(500).send('伺服器錯誤：' + err.message);
     }
 });
 
