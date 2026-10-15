@@ -88,5 +88,8 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
     }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// 請確認 server.js 最底下的監聽程式碼如下：
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on port ${PORT}`);
+});
