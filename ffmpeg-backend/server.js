@@ -13,6 +13,10 @@ const upload = multer({ dest: 'uploads/' });
 
 app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req, res) => {
     try {
+        if (!req.files || !req.files['image'] || !req.files['audio']) {
+            return res.status(400).send('缺少圖片或音訊檔案');
+        }
+
         const imageFile = req.files['image'][0];
         const audioFile = req.files['audio'][0];
         const enhanceType = req.body.enhance || 'none';
@@ -21,16 +25,16 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
 
         let command = ffmpeg()
             .input(imageFile.path)
-            .loop()
+            .inputOptions(['-loop 1'])
             .input(audioFile.path)
             .videoCodec('libx264')
-            .preset('ultrafast')
-            .tune('stillimage')
             .size('1280x720')
             .fps(25)
             .audioCodec('aac')
             .audioBitrate('192k')
             .outputOptions([
+                '-preset ultrafast',
+                '-tune stillimage',
                 '-pix_fmt yuv420p',
                 '-shortest',
                 '-movflags +faststart'
@@ -47,9 +51,9 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
             .on('end', () => {
                 // 轉碼成功，回傳影片並刪除暫存檔
                 res.download(outputPath, 'output.mp4', () => {
-                    fs.unlinkSync(imageFile.path);
-                    fs.unlinkSync(audioFile.path);
-                    fs.unlinkSync(outputPath);
+                    if (fs.existsSync(imageFile.path)) fs.unlinkSync(imageFile.path);
+                    if (fs.existsSync(audioFile.path)) fs.unlinkSync(audioFile.path);
+                    if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
                 });
             })
             .on('error', (err) => {
@@ -57,10 +61,12 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
                 res.status(500).send('轉碼失敗：' + err.message);
                 if (fs.existsSync(imageFile.path)) fs.unlinkSync(imageFile.path);
                 if (fs.existsSync(audioFile.path)) fs.unlinkSync(audioFile.path);
+                if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
             })
             .save(outputPath);
 
     } catch (err) {
+        console.error('Server Error:', err);
         res.status(500).send('伺服器錯誤：' + err.message);
     }
 });
