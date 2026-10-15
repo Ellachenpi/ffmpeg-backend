@@ -40,7 +40,7 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
             .input(audioFile.path)
             .videoCodec('libx264')
             .size('1280x720')
-            .fps(0.1) // 10 秒 1 幀 (0.1 fps)，大幅降低 CPU 負擔
+            .fps(1) // 改回穩定的 1 fps（時間軸正常推進，速度依舊極快）
             .outputOptions([
                 '-preset ultrafast',
                 '-tune stillimage',
@@ -52,7 +52,7 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
 
         // 聲音處理選項：
         if (enhanceType === 'none') {
-            // 原始音效：直接複製音訊流 (c:a copy)，無需重新編碼，速度最快、音質零損失！
+            // 原始音效：直接複製音訊流 (c:a copy)，速度最快、不耗費 CPU
             command.audioCodec('copy');
         } else if (enhanceType === 'boost') {
             // 音量清晰提升
@@ -61,9 +61,7 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
                    .audioFilters('volume=1.4,highpass=f=80');
         } else if (enhanceType === 'denoise') {
             // 消除低頻雜音
-            command.audioCodec('aac')
-                   .audioBitrate('128k')
-                   .audioFilters('highpass=f=120,volume=1.3');
+            command.audioFilters('highpass=f=120,volume=1.3');
         }
 
         command
