@@ -8,7 +8,7 @@ const path = require('path');
 const app = express();
 app.use(cors());
 
-// 確保 uploads 暫存資料夾一定存在
+// 確保 uploads 暫存資料夾存在
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
@@ -17,9 +17,9 @@ if (!fs.existsSync(uploadDir)) {
 const upload = multer({ dest: uploadDir });
 
 app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req, res) => {
-    // 延長此請求的 HTTP 超時時間至 10 分鐘，避免大檔案壓碼到一半被斷線
-    req.setTimeout(600000);
-    res.setTimeout(600000);
+    // 延長 HTTP 超時時間至 20 分鐘
+    req.setTimeout(1200000);
+    res.setTimeout(1200000);
 
     try {
         if (!req.files || !req.files['image'] || !req.files['audio']) {
@@ -32,7 +32,7 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
 
         const outputPath = path.join(uploadDir, `output_${Date.now()}.mp4`);
 
-        console.log(`[開始壓碼] 圖片: ${imageFile.originalname}, 音檔: ${audioFile.originalname}`);
+        console.log(`[開始壓碼] 圖片: ${imageFile.originalname}, 音檔: ${audioFile.originalname}, 強化選項: ${enhanceType}`);
 
         let command = ffmpeg()
             .input(imageFile.path)
@@ -40,22 +40,30 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
             .input(audioFile.path)
             .videoCodec('libx264')
             .size('1280x720')
-            .fps(25)
-            .audioCodec('aac')
-            .audioBitrate('192k')
+            .fps(0.1) // 10 秒 1 幀 (0.1 fps)，大幅降低 CPU 負擔
             .outputOptions([
                 '-preset ultrafast',
                 '-tune stillimage',
                 '-pix_fmt yuv420p',
                 '-shortest',
+                '-threads 0',
                 '-movflags +faststart'
             ]);
 
-        // 聲音強化選項
-        if (enhanceType === 'boost') {
-            command.audioFilters('loudnorm=I=-16:TP=-1.5:LRA=11,highpass=f=80');
+        // 聲音處理選項：
+        if (enhanceType === 'none') {
+            // 原始音效：直接複製音訊流 (c:a copy)，無需重新編碼，速度最快、音質零損失！
+            command.audioCodec('copy');
+        } else if (enhanceType === 'boost') {
+            // 音量清晰提升
+            command.audioCodec('aac')
+                   .audioBitrate('128k')
+                   .audioFilters('volume=1.4,highpass=f=80');
         } else if (enhanceType === 'denoise') {
-            command.audioFilters('highpass=f=120,volume=1.3');
+            // 消除低頻雜音
+            command.audioCodec('aac')
+                   .audioBitrate('128k')
+                   .audioFilters('highpass=f=120,volume=1.3');
         }
 
         command
@@ -67,7 +75,6 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
             .on('end', () => {
                 console.log('[壓碼成功] 正在傳送影片回前端...');
                 res.download(outputPath, 'output.mp4', () => {
-                    // 下載完成後自動清理伺服器暫存
                     if (fs.existsSync(imageFile.path)) fs.unlinkSync(imageFile.path);
                     if (fs.existsSync(audioFile.path)) fs.unlinkSync(audioFile.path);
                     if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
@@ -88,7 +95,6 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
     }
 });
 
-// 請確認 server.js 最底下的監聽程式碼如下：
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
