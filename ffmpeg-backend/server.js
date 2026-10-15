@@ -14,7 +14,18 @@ if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
 }
 
-const upload = multer({ dest: uploadDir });
+// 修正：強制改用安全純英文檔名，避免中文亂碼造成 FFmpeg 解析失敗
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, uploadDir);
+    },
+    filename: (req, file, cb) => {
+        const ext = path.extname(file.originalname) || (file.fieldname === 'image' ? '.jpg' : '.mp3');
+        cb(null, `${file.fieldname}_${Date.now()}${ext}`);
+    }
+});
+
+const upload = multer({ storage: storage });
 
 app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req, res) => {
     // 延長 HTTP 超時時間至 20 分鐘
@@ -32,7 +43,7 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
 
         const outputPath = path.join(uploadDir, `output_${Date.now()}.mp4`);
 
-        console.log(`[開始壓碼] 圖片: ${imageFile.originalname}, 音檔: ${audioFile.originalname}, 強化選項: ${enhanceType}`);
+        console.log(`[開始壓碼] 圖片路徑: ${imageFile.path}, 音檔路徑: ${audioFile.path}, 強化選項: ${enhanceType}`);
 
         let command = ffmpeg()
             .input(imageFile.path)
@@ -40,7 +51,7 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
             .input(audioFile.path)
             .videoCodec('libx264')
             .size('1280x720')
-            .fps(1) // 改回穩定的 1 fps（時間軸正常推進，速度依舊極快）
+            .fps(1) // 穩定 1 fps
             .outputOptions([
                 '-preset ultrafast',
                 '-tune stillimage',
@@ -50,9 +61,9 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
                 '-movflags +faststart'
             ]);
 
-        // 聲音處理選項：
+        // 聲音處理選項
         if (enhanceType === 'none') {
-            // 原始音效：直接複製音訊流 (c:a copy)，速度最快、不耗費 CPU
+            // 原始音效：直接複製音訊流 (c:a copy)，極速且音質無損
             command.audioCodec('copy');
         } else if (enhanceType === 'boost') {
             // 音量清晰提升
