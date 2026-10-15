@@ -8,10 +8,19 @@ const path = require('path');
 const app = express();
 app.use(cors());
 
-// 設定檔案暫存區
-const upload = multer({ dest: 'uploads/' });
+// 確保 uploads 暫存資料夾一定存在
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+}
+
+const upload = multer({ dest: uploadDir });
 
 app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req, res) => {
+    // 延長此請求的 HTTP 超時時間至 10 分鐘，避免大檔案壓碼到一半被斷線
+    req.setTimeout(600000);
+    res.setTimeout(600000);
+
     try {
         if (!req.files || !req.files['image'] || !req.files['audio']) {
             return res.status(400).send('缺少圖片或音訊檔案');
@@ -21,7 +30,9 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
         const audioFile = req.files['audio'][0];
         const enhanceType = req.body.enhance || 'none';
 
-        const outputPath = path.join(__dirname, 'uploads', `output_${Date.now()}.mp4`);
+        const outputPath = path.join(uploadDir, `output_${Date.now()}.mp4`);
+
+        console.log(`[開始壓碼] 圖片: ${imageFile.originalname}, 音檔: ${audioFile.originalname}`);
 
         let command = ffmpeg()
             .input(imageFile.path)
@@ -48,16 +59,22 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
         }
 
         command
+            .on('progress', (progress) => {
+                if (progress.timemark) {
+                    console.log(`[壓碼進度] 已處理時間: ${progress.timemark}`);
+                }
+            })
             .on('end', () => {
-                // 轉碼成功，回傳影片並刪除暫存檔
+                console.log('[壓碼成功] 正在傳送影片回前端...');
                 res.download(outputPath, 'output.mp4', () => {
+                    // 下載完成後自動清理伺服器暫存
                     if (fs.existsSync(imageFile.path)) fs.unlinkSync(imageFile.path);
                     if (fs.existsSync(audioFile.path)) fs.unlinkSync(audioFile.path);
                     if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
                 });
             })
             .on('error', (err) => {
-                console.error('FFmpeg Error:', err);
+                console.error('[FFmpeg 錯誤]:', err);
                 res.status(500).send('轉碼失敗：' + err.message);
                 if (fs.existsSync(imageFile.path)) fs.unlinkSync(imageFile.path);
                 if (fs.existsSync(audioFile.path)) fs.unlinkSync(audioFile.path);
@@ -66,7 +83,7 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
             .save(outputPath);
 
     } catch (err) {
-        console.error('Server Error:', err);
+        console.error('[伺服器例外錯誤]:', err);
         res.status(500).send('伺服器錯誤：' + err.message);
     }
 });
