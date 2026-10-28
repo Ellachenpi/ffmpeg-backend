@@ -9,5 +9,5 @@ RUN npm install
 COPY . .
 
 EXPOSE 10000
-# 關鍵修正：直接用 node 啟動，不要透過 npm start
+# 直接使用 node 執行，確保正確接收訊號
 CMD ["node", "server.js"]
