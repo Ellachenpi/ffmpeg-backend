@@ -11,12 +11,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 請替換為您的 Google Client ID 與 Client Secret
 const CLIENT_ID = '124484081362-42ffam7ts867htags708jsb4rg88vl4e.apps.googleusercontent.com';
-const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '您的_CLIENT_SECRET'; // 建議放在 Render 環境變數
+const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
 const REDIRECT_URI = 'https://ffmpeg-backend-72s6.onrender.com/auth/callback';
-
-const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
 
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
@@ -50,27 +47,24 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage: storage });
 
-// ------------------- OAuth2 授權路由 -------------------
-
-// 1. 前端獲取授權網址
 app.get('/auth/url', (req, res) => {
+    const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
     const authUrl = oauth2Client.generateAuthUrl({
-        access_type: 'offline', // 關鍵：要求取得 refresh_token
-        prompt: 'consent',     // 強制跳出同意畫面以確保拿到 refresh_token
+        access_type: 'offline',
+        prompt: 'consent',
         scope: ['https://www.googleapis.com/auth/youtube.upload']
     });
     res.json({ url: authUrl });
 });
 
-// 2. Google OAuth 回呼處理
 app.get('/auth/callback', async (req, res) => {
     const code = req.query.code;
     if (!code) return res.status(400).send('缺少 Authorization Code');
 
     try {
+        const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
         const { tokens } = await oauth2Client.getToken(code);
         
-        // 成功取得 tokens，回傳 script 關閉彈窗並把 tokens 傳給前端
         res.send(`
             <script>
                 if (window.opener) {
@@ -87,8 +81,6 @@ app.get('/auth/callback', async (req, res) => {
     }
 });
 
-// ------------------- 任務處理與查詢 -------------------
-
 app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req, res) => {
     try {
         if (!req.files || !req.files['image'] || !req.files['audio']) {
@@ -99,7 +91,7 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
         const accessToken = req.body.accessToken;
 
         if (!refreshToken && !accessToken) {
-            return res.status(400).send('未提供有效的 YouTube 授權 Token，請重新連結帳號');
+            return res.status(400).send('未提供有效的 YouTube 授權 Token');
         }
 
         const jobId = `job_${Date.now()}`;
@@ -113,7 +105,7 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
 
         res.json({ success: true, jobId: jobId });
 
-        runLightweightJobWithRefresh(jobId, imageFile, audioFile, refreshToken, accessToken, ytTitle, ytDescription, ytPrivacy);
+        runMemoryControlledJob(jobId, imageFile, audioFile, refreshToken, accessToken, ytTitle, ytDescription, ytPrivacy);
 
     } catch (err) {
         console.error('[伺服器例外錯誤]:', err);
@@ -129,18 +121,17 @@ app.get('/status/:jobId', (req, res) => {
     res.json(job);
 });
 
-function runLightweightJobWithRefresh(jobId, imageFile, audioFile, refreshToken, accessToken, ytTitle, ytDescription, ytPrivacy) {
-    console.log(`[輕量化任務開始 - Refresh Token 模式] JobID: ${jobId}`);
+function runMemoryControlledJob(jobId, imageFile, audioFile, refreshToken, accessToken, ytTitle, ytDescription, ytPrivacy) {
+    console.log(`[記憶體控管任務開始] JobID: ${jobId}`);
 
     const auth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-    
-    // 設定 Token（如果有 Refresh Token 會自動在過期時自動刷新）
     auth.setCredentials({
         access_token: accessToken,
         refresh_token: refreshToken
     });
 
-    const videoStream = new PassThrough();
+    // 關鍵修復：限制 Stream 內部緩衝區上限為 1MB (highWaterMark)，防止數據積壓撐爆 512MB RAM
+    const videoStream = new PassThrough({ highWaterMark: 1024 * 1024 });
     const youtube = google.youtube({ version: 'v3', auth: auth });
 
     const uploadPromise = youtube.videos.insert({
@@ -157,7 +148,7 @@ function runLightweightJobWithRefresh(jobId, imageFile, audioFile, refreshToken,
         .inputOptions(['-loop 1'])
         .input(audioFile.path)
         .videoCodec('libx264')
-        .size('640x360')
+        .size('480x270') // 解析度調為 270p，徹底把 CPU 與 RAM 佔用壓到最低！
         .fps(1)
         .outputOptions([
             '-preset ultrafast',
