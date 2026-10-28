@@ -41,11 +41,25 @@ const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, uploadDir),
     filename: (req, file, cb) => {
         const ext = path.extname(file.originalname) || (file.fieldname === 'image' ? '.jpg' : '.mp3');
-        cb(null, `${file.fieldname}_${Date.now()}${ext}`);
+        cb(null, `${file.fieldname}_${Date.now()}_${Math.round(Math.random() * 1E9)}${ext}`);
     }
 });
 
 const upload = multer({ storage: storage });
+
+// 佇列管理：確保多個音檔依序處理，不併發吃滿記憶體
+const queue = [];
+let isProcessing = false;
+
+function processQueue() {
+    if (isProcessing || queue.length === 0) return;
+    isProcessing = true;
+    const task = queue.shift();
+    runMemoryControlledJob(task, () => {
+        isProcessing = false;
+        processQueue(); // 處理下一個任務
+    });
+}
 
 app.get('/auth/url', (req, res) => {
     const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
@@ -64,7 +78,6 @@ app.get('/auth/callback', async (req, res) => {
     try {
         const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
         const { tokens } = await oauth2Client.getToken(code);
-        
         res.send(`
             <script>
                 if (window.opener) {
@@ -81,7 +94,8 @@ app.get('/auth/callback', async (req, res) => {
     }
 });
 
-app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req, res) => {
+// 支援單個或多個音檔批次建立任務
+app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 10 }]), (req, res) => {
     try {
         if (!req.files || !req.files['image'] || !req.files['audio']) {
             return res.status(400).send('缺少圖片或音訊檔案');
@@ -94,18 +108,47 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
             return res.status(400).send('未提供有效的 YouTube 授權 Token');
         }
 
-        const jobId = `job_${Date.now()}`;
         const imageFile = req.files['image'][0];
-        const audioFile = req.files['audio'][0];
+        const audioFiles = req.files['audio'];
         const ytTitle = req.body.title || 'My Audio Track';
         const ytDescription = req.body.description || 'Uploaded with Web App';
         const ytPrivacy = req.body.privacy || 'private';
 
-        updateJob(jobId, { status: 'processing', progress: '00:00:00', videoUrl: null, error: null });
+        const createdJobIds = [];
 
-        res.json({ success: true, jobId: jobId });
+        // 為每一個音檔建立獨立 Job
+        audioFiles.forEach((audioFile, index) => {
+            const jobId = `job_${Date.now()}_${index + 1}`;
+            const titleWithIndex = audioFiles.length > 1 ? `${ytTitle} (${index + 1}/${audioFiles.length})` : ytTitle;
 
-        runMemoryControlledJob(jobId, imageFile, audioFile, refreshToken, accessToken, ytTitle, ytDescription, ytPrivacy);
+            updateJob(jobId, {
+                status: 'queued',
+                progress: '排隊中...',
+                fileName: audioFile.originalname,
+                videoUrl: null,
+                error: null
+            });
+
+            createdJobIds.push(jobId);
+
+            // 加入背景執行佇列
+            queue.push({
+                jobId,
+                imageFile,
+                audioFile,
+                refreshToken,
+                accessToken,
+                ytTitle: titleWithIndex,
+                ytDescription,
+                ytPrivacy
+            });
+        });
+
+        // 立即回應手機所有的 Job ID 陣列
+        res.json({ success: true, jobIds: createdJobIds });
+
+        // 啟動佇列處理器
+        processQueue();
 
     } catch (err) {
         console.error('[伺服器例外錯誤]:', err);
@@ -113,24 +156,30 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
     }
 });
 
-app.get('/status/:jobId', (req, res) => {
-    const jobId = req.params.jobId;
+app.get('/status/batch', (req, res) => {
+    const idsParam = req.query.ids;
+    if (!idsParam) return res.status(400).json({ error: '缺少 ids 參數' });
+
+    const jobIds = idsParam.split(',');
     const jobs = getJobs();
-    const job = jobs[jobId];
-    if (!job) return res.status(404).json({ error: '找不到該任務' });
-    res.json(job);
-});
+    const result = {};
 
-function runMemoryControlledJob(jobId, imageFile, audioFile, refreshToken, accessToken, ytTitle, ytDescription, ytPrivacy) {
-    console.log(`[記憶體控管任務開始] JobID: ${jobId}`);
-
-    const auth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-    auth.setCredentials({
-        access_token: accessToken,
-        refresh_token: refreshToken
+    jobIds.forEach(id => {
+        if (jobs[id]) result[id] = jobs[id];
     });
 
-    // 關鍵修復：限制 Stream 內部緩衝區上限為 1MB (highWaterMark)，防止數據積壓撐爆 512MB RAM
+    res.json(result);
+});
+
+function runMemoryControlledJob(task, next) {
+    const { jobId, imageFile, audioFile, refreshToken, accessToken, ytTitle, ytDescription, ytPrivacy } = task;
+
+    console.log(`[佇列任務開始] JobID: ${jobId}, 檔案: ${audioFile.originalname}`);
+    updateJob(jobId, { status: 'processing', progress: '00:00:00' });
+
+    const auth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
+    auth.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
+
     const videoStream = new PassThrough({ highWaterMark: 1024 * 1024 });
     const youtube = google.youtube({ version: 'v3', auth: auth });
 
@@ -148,7 +197,7 @@ function runMemoryControlledJob(jobId, imageFile, audioFile, refreshToken, acces
         .inputOptions(['-loop 1'])
         .input(audioFile.path)
         .videoCodec('libx264')
-        .size('480x270') // 解析度調為 270p，徹底把 CPU 與 RAM 佔用壓到最低！
+        .size('480x270')
         .fps(1)
         .outputOptions([
             '-preset ultrafast',
@@ -165,34 +214,34 @@ function runMemoryControlledJob(jobId, imageFile, audioFile, refreshToken, acces
         .on('progress', (progress) => {
             if (progress.timemark) {
                 updateJob(jobId, { progress: progress.timemark });
-                console.log(`[${jobId} 進度] ${progress.timemark}`);
             }
         })
         .on('end', async () => {
-            console.log(`[${jobId} 轉碼完成] 等待 YouTube 發布確認...`);
+            console.log(`[${jobId} 轉碼完成] 等待 YouTube 發布...`);
             updateJob(jobId, { progress: '正在完成 YouTube 發布...' });
             try {
                 const uploadRes = await uploadPromise;
-                console.log(`[${jobId} YouTube 上傳成功] Video ID: ${uploadRes.data.id}`);
+                console.log(`[${jobId} 上傳成功] Video ID: ${uploadRes.data.id}`);
                 updateJob(jobId, { status: 'completed', videoUrl: `https://youtu.be/${uploadRes.data.id}` });
             } catch (ytErr) {
                 console.error(`[${jobId} YouTube 失敗]:`, ytErr);
                 updateJob(jobId, { status: 'error', error: 'YouTube 上傳失敗：' + (ytErr.message || '授權失效') });
             } finally {
-                cleanupFiles(imageFile.path, audioFile.path);
+                cleanupAudio(audioFile.path);
+                next(); // 完成後觸發下一個佇列任務
             }
         })
         .on('error', (err) => {
             console.error(`[${jobId} FFmpeg 錯誤]:`, err);
             updateJob(jobId, { status: 'error', error: '轉碼失敗：' + err.message });
-            cleanupFiles(imageFile.path, audioFile.path);
+            cleanupAudio(audioFile.path);
+            next();
         })
         .pipe(videoStream, { end: true });
 }
 
-function cleanupFiles(img, audio) {
-    if (fs.existsSync(img)) fs.unlinkSync(img);
-    if (fs.existsSync(audio)) fs.unlinkSync(audio);
+function cleanupAudio(audioPath) {
+    if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
 }
 
 const PORT = process.env.PORT || 10000;
