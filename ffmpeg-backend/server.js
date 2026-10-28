@@ -62,9 +62,10 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
 
         updateJob(jobId, { status: 'processing', progress: '00:00:00', videoUrl: null, error: null });
 
+        // 2 秒內立即回應手機
         res.json({ success: true, jobId: jobId });
 
-        runDirectStreamJob(jobId, imageFile, audioFile, accessToken, ytTitle, ytDescription, ytPrivacy);
+        runLightweightJob(jobId, imageFile, audioFile, accessToken, ytTitle, ytDescription, ytPrivacy);
 
     } catch (err) {
         console.error('[伺服器例外錯誤]:', err);
@@ -80,17 +81,16 @@ app.get('/status/:jobId', (req, res) => {
     res.json(job);
 });
 
-function runDirectStreamJob(jobId, imageFile, audioFile, accessToken, ytTitle, ytDescription, ytPrivacy) {
-    console.log(`[直傳任務開始] JobID: ${jobId}`);
+function runLightweightJob(jobId, imageFile, audioFile, accessToken, ytTitle, ytDescription, ytPrivacy) {
+    console.log(`[輕量化任務開始] JobID: ${jobId}`);
 
-    // 使用記憶體 Stream 管道，完全不產出硬碟 MP4 檔！
     const videoStream = new PassThrough();
 
-    // 先異步啟動 YouTube 上傳監聽
     const oauth2Client = new google.auth.OAuth2();
     oauth2Client.setCredentials({ access_token: accessToken });
     const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
 
+    // YouTube 管道上傳
     const uploadPromise = youtube.videos.insert({
         part: ['snippet', 'status'],
         requestBody: {
@@ -105,7 +105,7 @@ function runDirectStreamJob(jobId, imageFile, audioFile, accessToken, ytTitle, y
         .inputOptions(['-loop 1'])
         .input(audioFile.path)
         .videoCodec('libx264')
-        .size('1280x720')
+        .size('640x360') // 解析度降為 360p，記憶體佔用減少 75%，防止 512MB RAM 溢出卡死
         .fps(1)
         .outputOptions([
             '-preset ultrafast',
@@ -114,9 +114,9 @@ function runDirectStreamJob(jobId, imageFile, audioFile, accessToken, ytTitle, y
             '-shortest',
             '-threads 1',
             '-f mp4',
-            '-movflags frag_keyframe+empty_moov' // 關鍵：讓串流邊壓邊發送，不佔用硬碟
+            '-movflags frag_keyframe+empty_moov' // 管道直傳，不產出實體 MP4 暫存檔
         ])
-        .audioCodec('copy');
+        .audioCodec('copy'); // 音訊直接複製，0 CPU 負擔
 
     command
         .on('progress', (progress) => {
@@ -126,7 +126,8 @@ function runDirectStreamJob(jobId, imageFile, audioFile, accessToken, ytTitle, y
             }
         })
         .on('end', async () => {
-            console.log(`[${jobId} FFmpeg 轉碼串流完成] 等待 YouTube 處理...`);
+            console.log(`[${jobId} 轉碼完成] 等待 YouTube 發布確認...`);
+            updateJob(jobId, { progress: '正在完成 YouTube 發布...' });
             try {
                 const uploadRes = await uploadPromise;
                 console.log(`[${jobId} YouTube 上傳成功] Video ID: ${uploadRes.data.id}`);
