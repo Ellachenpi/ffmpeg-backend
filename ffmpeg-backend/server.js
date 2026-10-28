@@ -9,6 +9,14 @@ const { google } = require('googleapis');
 
 const app = express();
 app.use(cors());
+app.use(express.json());
+
+// 請替換為您的 Google Client ID 與 Client Secret
+const CLIENT_ID = '124484081362-42ffam7ts867htags708jsb4rg88vl4e.apps.googleusercontent.com';
+const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '您的_CLIENT_SECRET'; // 建議放在 Render 環境變數
+const REDIRECT_URI = 'https://ffmpeg-backend-72s6.onrender.com/auth/callback';
+
+const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
 
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
@@ -42,15 +50,56 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage: storage });
 
+// ------------------- OAuth2 授權路由 -------------------
+
+// 1. 前端獲取授權網址
+app.get('/auth/url', (req, res) => {
+    const authUrl = oauth2Client.generateAuthUrl({
+        access_type: 'offline', // 關鍵：要求取得 refresh_token
+        prompt: 'consent',     // 強制跳出同意畫面以確保拿到 refresh_token
+        scope: ['https://www.googleapis.com/auth/youtube.upload']
+    });
+    res.json({ url: authUrl });
+});
+
+// 2. Google OAuth 回呼處理
+app.get('/auth/callback', async (req, res) => {
+    const code = req.query.code;
+    if (!code) return res.status(400).send('缺少 Authorization Code');
+
+    try {
+        const { tokens } = await oauth2Client.getToken(code);
+        
+        // 成功取得 tokens，回傳 script 關閉彈窗並把 tokens 傳給前端
+        res.send(`
+            <script>
+                if (window.opener) {
+                    window.opener.postMessage({ type: 'OAUTH_SUCCESS', tokens: ${JSON.stringify(tokens)} }, '*');
+                    window.close();
+                } else {
+                    document.write('授權成功！請返回原頁面。');
+                }
+            </script>
+        `);
+    } catch (err) {
+        console.error('Exchange token error:', err);
+        res.status(500).send('授權失敗：' + err.message);
+    }
+});
+
+// ------------------- 任務處理與查詢 -------------------
+
 app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req, res) => {
     try {
         if (!req.files || !req.files['image'] || !req.files['audio']) {
             return res.status(400).send('缺少圖片或音訊檔案');
         }
 
+        const refreshToken = req.body.refreshToken;
         const accessToken = req.body.accessToken;
-        if (!accessToken) {
-            return res.status(400).send('未提供 YouTube Access Token');
+
+        if (!refreshToken && !accessToken) {
+            return res.status(400).send('未提供有效的 YouTube 授權 Token，請重新連結帳號');
         }
 
         const jobId = `job_${Date.now()}`;
@@ -62,10 +111,9 @@ app.post('/convert', upload.fields([{ name: 'image' }, { name: 'audio' }]), (req
 
         updateJob(jobId, { status: 'processing', progress: '00:00:00', videoUrl: null, error: null });
 
-        // 2 秒內立即回應手機
         res.json({ success: true, jobId: jobId });
 
-        runLightweightJob(jobId, imageFile, audioFile, accessToken, ytTitle, ytDescription, ytPrivacy);
+        runLightweightJobWithRefresh(jobId, imageFile, audioFile, refreshToken, accessToken, ytTitle, ytDescription, ytPrivacy);
 
     } catch (err) {
         console.error('[伺服器例外錯誤]:', err);
@@ -81,16 +129,20 @@ app.get('/status/:jobId', (req, res) => {
     res.json(job);
 });
 
-function runLightweightJob(jobId, imageFile, audioFile, accessToken, ytTitle, ytDescription, ytPrivacy) {
-    console.log(`[輕量化任務開始] JobID: ${jobId}`);
+function runLightweightJobWithRefresh(jobId, imageFile, audioFile, refreshToken, accessToken, ytTitle, ytDescription, ytPrivacy) {
+    console.log(`[輕量化任務開始 - Refresh Token 模式] JobID: ${jobId}`);
+
+    const auth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
+    
+    // 設定 Token（如果有 Refresh Token 會自動在過期時自動刷新）
+    auth.setCredentials({
+        access_token: accessToken,
+        refresh_token: refreshToken
+    });
 
     const videoStream = new PassThrough();
+    const youtube = google.youtube({ version: 'v3', auth: auth });
 
-    const oauth2Client = new google.auth.OAuth2();
-    oauth2Client.setCredentials({ access_token: accessToken });
-    const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
-
-    // YouTube 管道上傳
     const uploadPromise = youtube.videos.insert({
         part: ['snippet', 'status'],
         requestBody: {
@@ -105,7 +157,7 @@ function runLightweightJob(jobId, imageFile, audioFile, accessToken, ytTitle, yt
         .inputOptions(['-loop 1'])
         .input(audioFile.path)
         .videoCodec('libx264')
-        .size('640x360') // 解析度降為 360p，記憶體佔用減少 75%，防止 512MB RAM 溢出卡死
+        .size('640x360')
         .fps(1)
         .outputOptions([
             '-preset ultrafast',
@@ -114,9 +166,9 @@ function runLightweightJob(jobId, imageFile, audioFile, accessToken, ytTitle, yt
             '-shortest',
             '-threads 1',
             '-f mp4',
-            '-movflags frag_keyframe+empty_moov' // 管道直傳，不產出實體 MP4 暫存檔
+            '-movflags frag_keyframe+empty_moov'
         ])
-        .audioCodec('copy'); // 音訊直接複製，0 CPU 負擔
+        .audioCodec('copy');
 
     command
         .on('progress', (progress) => {
