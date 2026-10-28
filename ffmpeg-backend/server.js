@@ -5,7 +5,7 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const { PassThrough } = require('stream');
-const ytdl = require('@distube/ytdl-core'); // 使用穩定的 ytdl 套件
+const { spawn } = require('child_process');
 const { google } = require('googleapis');
 
 const app = express();
@@ -60,7 +60,7 @@ app.get('/auth/url', (req, res) => {
     const authUrl = oauth2Client.generateAuthUrl({
         access_type: 'offline',
         prompt: 'consent',
-        scope: ['https://www.googleapis.com/auth/youtube.upload']
+        scope: ['https://www.googleapis.com/auth/youtube.upload', 'https://www.googleapis.com/auth/youtube.readonly']
     });
     res.json({ url: authUrl });
 });
@@ -153,7 +153,7 @@ app.get('/status/batch', (req, res) => {
     res.json(result);
 });
 
-async function runMemoryControlledJob(task, next) {
+function runMemoryControlledJob(task, next) {
     const { jobId, imageFile, sourceType, audioFile, ytUrl, startTime, endTime, refreshToken, accessToken, ytTitle, ytDescription, ytPrivacy } = task;
 
     console.log(`[佇列任務開始] JobID: ${jobId}, 模式: ${sourceType}`);
@@ -177,18 +177,33 @@ async function runMemoryControlledJob(task, next) {
     let command = ffmpeg();
 
     if (sourceType === 'youtube') {
-        try {
-            // 取得純音訊 Stream
-            const audioStream = ytdl(ytUrl, {
-                filter: 'audioonly',
-                quality: 'highestaudio',
-                highWaterMark: 1 << 25
-            });
+        // 使用 yt-dlp 模擬真實瀏覽器 Request Header (突破 429 封鎖)
+        const args = [
+            '-g',
+            '-f', 'ba/b',
+            '--add-header', `Authorization: Bearer ${accessToken}`,
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            ytUrl
+        ];
+
+        const ytdlp = spawn('yt-dlp', args);
+        let audioUrl = '';
+        let errorLog = '';
+
+        ytdlp.stdout.on('data', (data) => { audioUrl += data.toString().trim(); });
+        ytdlp.stderr.on('data', (data) => { errorLog += data.toString(); });
+
+        ytdlp.on('close', (code) => {
+            if (code !== 0 || !audioUrl) {
+                console.error('yt-dlp 錯誤:', errorLog);
+                updateJob(jobId, { status: 'error', error: 'YouTube 音訊解析失敗 (已被 429 攔截或網址無效)' });
+                return next();
+            }
 
             command
                 .input(imageFile.path)
                 .inputOptions(['-loop 1'])
-                .input(audioStream)
+                .input(audioUrl)
                 .inputOptions([`-ss ${startTime}`, `-to ${endTime}`])
                 .videoCodec('libx264')
                 .size('480x270')
@@ -200,12 +215,7 @@ async function runMemoryControlledJob(task, next) {
                 .on('end', async () => handleUploadSuccess(uploadPromise, jobId, next))
                 .on('error', err => handleUploadError(err, jobId, next))
                 .pipe(videoStream, { end: true });
-
-        } catch (err) {
-            console.error('ytdl error:', err);
-            updateJob(jobId, { status: 'error', error: 'YouTube 音訊解析失敗：' + err.message });
-            return next();
-        }
+        });
     } else {
         command
             .input(imageFile.path)
