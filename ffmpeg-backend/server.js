@@ -5,7 +5,7 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const { PassThrough } = require('stream');
-const { spawn } = require('child_process');
+const ytdl = require('@distube/ytdl-core'); // 使用穩定的 ytdl 套件
 const { google } = require('googleapis');
 
 const app = express();
@@ -42,7 +42,6 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage: storage });
 
-// 佇列管理
 const queue = [];
 let isProcessing = false;
 
@@ -94,7 +93,7 @@ app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'aud
         if (!refreshToken && !accessToken) return res.status(400).send('未提供有效的 YouTube 授權 Token');
 
         const imageFile = req.files['image'][0];
-        const sourceType = req.body.sourceType || 'file'; // 'file' 或 'youtube'
+        const sourceType = req.body.sourceType || 'file';
         const ytTitle = req.body.title || 'My Audio Track';
         const ytDescription = req.body.description || 'Uploaded with Web App';
         const ytPrivacy = req.body.privacy || 'private';
@@ -102,7 +101,6 @@ app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'aud
         const createdJobIds = [];
 
         if (sourceType === 'youtube') {
-            // YouTube 網址區間擷取模式
             const ytUrl = req.body.ytUrl;
             const startTime = req.body.startTime || '00:00:00';
             const endTime = req.body.endTime || '00:05:00';
@@ -119,7 +117,6 @@ app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'aud
             });
 
         } else {
-            // 上傳本地音檔模式
             const audioFiles = req.files['audio'];
             if (!audioFiles || audioFiles.length === 0) return res.status(400).send('缺少音訊檔案');
 
@@ -156,7 +153,7 @@ app.get('/status/batch', (req, res) => {
     res.json(result);
 });
 
-function runMemoryControlledJob(task, next) {
+async function runMemoryControlledJob(task, next) {
     const { jobId, imageFile, sourceType, audioFile, ytUrl, startTime, endTime, refreshToken, accessToken, ytTitle, ytDescription, ytPrivacy } = task;
 
     console.log(`[佇列任務開始] JobID: ${jobId}, 模式: ${sourceType}`);
@@ -180,21 +177,18 @@ function runMemoryControlledJob(task, next) {
     let command = ffmpeg();
 
     if (sourceType === 'youtube') {
-        // 使用 yt-dlp 抓取音訊網址並直接切片串流
-        const ytdlp = spawn('yt-dlp', ['-g', '-f', 'bestaudio', ytUrl]);
-        let audioUrl = '';
-
-        ytdlp.stdout.on('data', (data) => { audioUrl += data.toString().trim(); });
-        ytdlp.on('close', (code) => {
-            if (code !== 0 || !audioUrl) {
-                updateJob(jobId, { status: 'error', error: '無法解析 YouTube 影片音訊網址' });
-                return next();
-            }
+        try {
+            // 取得純音訊 Stream
+            const audioStream = ytdl(ytUrl, {
+                filter: 'audioonly',
+                quality: 'highestaudio',
+                highWaterMark: 1 << 25
+            });
 
             command
                 .input(imageFile.path)
                 .inputOptions(['-loop 1'])
-                .input(audioUrl)
+                .input(audioStream)
                 .inputOptions([`-ss ${startTime}`, `-to ${endTime}`])
                 .videoCodec('libx264')
                 .size('480x270')
@@ -206,9 +200,13 @@ function runMemoryControlledJob(task, next) {
                 .on('end', async () => handleUploadSuccess(uploadPromise, jobId, next))
                 .on('error', err => handleUploadError(err, jobId, next))
                 .pipe(videoStream, { end: true });
-        });
+
+        } catch (err) {
+            console.error('ytdl error:', err);
+            updateJob(jobId, { status: 'error', error: 'YouTube 音訊解析失敗：' + err.message });
+            return next();
+        }
     } else {
-        // 檔案模式
         command
             .input(imageFile.path)
             .inputOptions(['-loop 1'])
