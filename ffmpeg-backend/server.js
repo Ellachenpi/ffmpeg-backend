@@ -102,7 +102,6 @@ function fetchMp3DirectUrl(apiUrl, targetUrl) {
             res.on('data', chunk => data += chunk);
             res.on('end', () => {
                 try {
-                    // 匹配 HTML 或 JSON 中的 MP3 檔案直鏈 (.mp3)
                     const mp3Match = data.match(/https?:\/\/[^"'\s]+\.mp3[^"'\s]*/i) || data.match(/href=["'](https?:\/\/[^"'\s]+mp3[^"'\s]*)["']/i);
                     if (mp3Match && mp3Match[1]) {
                         resolve(mp3Match[1]);
@@ -336,7 +335,11 @@ function handleFfmpegError(err, jobId, audioFile, tempMp4Path, next) {
         console.error(`[${jobId} FFmpeg 錯誤]:`, err);
         updateJob(jobId, { status: 'error', error: '音訊處理失敗：' + err.message });
     }
-    cleanupFiles(audioPath, mp4Path) {
+    cleanupFiles(audioFile ? audioFile.path : null, tempMp4Path);
+    next();
+}
+
+function cleanupFiles(audioPath, mp4Path) {
     if (audioPath && fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
     if (mp4Path && fs.existsSync(mp4Path)) fs.unlinkSync(mp4Path);
 }
