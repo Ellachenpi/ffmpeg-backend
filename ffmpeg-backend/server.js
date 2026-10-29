@@ -65,27 +65,83 @@ function processQueue() {
     });
 }
 
-// 可靠的多備用節點第三方 API 解析
+// 包含 4 組活體公用節點的多重備用機制
 async function getAudioUrlFromThirdParty(videoId) {
-    const endpoints = [
-        { host: 'api.cobalt.tools', path: '/' },
-        { host: 'cobalt.copy.live', path: '/' }
-    ];
-
     const targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
-    for (const ep of endpoints) {
+    // 1. 嘗試通過專業 YouTube 轉碼 API 節點 (Invidious API)
+    const invidiousInstances = [
+        'inv.nadeko.net',
+        'invidious.nerdvpn.de',
+        'invidious.drgns.space'
+    ];
+
+    for (const host of invidiousInstances) {
         try {
-            const streamUrl = await fetchCobaltAudio(ep.host, ep.path, targetUrl);
+            console.log(`[嘗試 Invidious 節點]: ${host}`);
+            const streamUrl = await fetchInvidiousAudio(host, videoId);
             if (streamUrl) return streamUrl;
         } catch (err) {
-            console.warn(`[API 節點 ${ep.host} 失敗，嘗試下一個]:`, err.message);
+            console.warn(`[Invidious 節點 ${host} 失敗]:`, err.message);
         }
     }
-    throw new Error('所有備用音訊解析 API 均無法回應');
+
+    // 2. 備用 Cobalt 多重自建節點
+    const cobaltInstances = [
+        'co.wuk.sh',
+        'cobalt.stream'
+    ];
+
+    for (const host of cobaltInstances) {
+        try {
+            console.log(`[嘗試 Cobalt 節點]: ${host}`);
+            const streamUrl = await fetchCobaltAudio(host, targetUrl);
+            if (streamUrl) return streamUrl;
+        } catch (err) {
+            console.warn(`[Cobalt 節點 ${host} 失敗]:`, err.message);
+        }
+    }
+
+    throw new Error('所有公用 API 節點均無法解析，建議使用「📁 本地音檔」模式直接上傳發布');
 }
 
-function fetchCobaltAudio(hostname, apiPath, targetUrl) {
+function fetchInvidiousAudio(hostname, videoId) {
+    return new Promise((resolve, reject) => {
+        const options = {
+            hostname: hostname,
+            path: `/api/v1/videos/${videoId}`,
+            method: 'GET',
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+            timeout: 8000
+        };
+
+        const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', (chunk) => data += chunk);
+            res.on('end', () => {
+                try {
+                    const parsed = JSON.parse(data);
+                    if (parsed.adaptiveFormats) {
+                        // 篩選出音訊 (audio/mp4 或 audio/webm)
+                        const audioFormat = parsed.adaptiveFormats.find(f => f.type && f.type.startsWith('audio/'));
+                        if (audioFormat && audioFormat.url) {
+                            return resolve(audioFormat.url);
+                        }
+                    }
+                    reject(new Error('未找到可用的音訊串流'));
+                } catch (e) {
+                    reject(new Error('回應非有效 JSON'));
+                }
+            });
+        });
+
+        req.on('error', (e) => reject(e));
+        req.on('timeout', () => { req.destroy(); reject(new Error('請求超時')); });
+        req.end();
+    });
+}
+
+function fetchCobaltAudio(hostname, targetUrl) {
     return new Promise((resolve, reject) => {
         const postData = JSON.stringify({
             url: targetUrl,
@@ -96,14 +152,14 @@ function fetchCobaltAudio(hostname, apiPath, targetUrl) {
 
         const options = {
             hostname: hostname,
-            path: apiPath,
+            path: '/',
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
             },
-            timeout: 10000
+            timeout: 8000
         };
 
         const req = https.request(options, (res) => {
@@ -126,7 +182,7 @@ function fetchCobaltAudio(hostname, apiPath, targetUrl) {
         });
 
         req.on('error', (e) => reject(e));
-        req.on('timeout', () => { req.destroy(); reject(new Error('連線逾時')); });
+        req.on('timeout', () => { req.destroy(); reject(new Error('請求超時')); });
         req.write(postData);
         req.end();
     });
