@@ -65,18 +65,45 @@ function processQueue() {
     });
 }
 
-// 輔助函式：透過第三方 API 繞過機房 429 取得 YouTube 純音訊直鏈
+// 可靠的多備用節點第三方 API 解析
 async function getAudioUrlFromThirdParty(videoId) {
+    const endpoints = [
+        { host: 'api.cobalt.tools', path: '/' },
+        { host: 'cobalt.copy.live', path: '/' }
+    ];
+
+    const targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
+
+    for (const ep of endpoints) {
+        try {
+            const streamUrl = await fetchCobaltAudio(ep.host, ep.path, targetUrl);
+            if (streamUrl) return streamUrl;
+        } catch (err) {
+            console.warn(`[API 節點 ${ep.host} 失敗，嘗試下一個]:`, err.message);
+        }
+    }
+    throw new Error('所有備用音訊解析 API 均無法回應');
+}
+
+function fetchCobaltAudio(hostname, apiPath, targetUrl) {
     return new Promise((resolve, reject) => {
-        // 使用 Cobalt / Third-party API 解析音訊
+        const postData = JSON.stringify({
+            url: targetUrl,
+            downloadMode: 'audio',
+            audioFormat: 'mp3',
+            isAudioOnly: true
+        });
+
         const options = {
-            hostname: 'cobalt-api.kwiatek.xyz', // 開源免費無 429 機房限制之解析節點
-            path: '/',
+            hostname: hostname,
+            path: apiPath,
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            }
+                'Accept': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            },
+            timeout: 10000
         };
 
         const req = https.request(options, (res) => {
@@ -87,20 +114,20 @@ async function getAudioUrlFromThirdParty(videoId) {
                     const parsed = JSON.parse(data);
                     if (parsed.url) {
                         resolve(parsed.url);
+                    } else if (parsed.picker && parsed.picker.length > 0) {
+                        resolve(parsed.picker[0].url);
                     } else {
-                        reject(new Error('無法取得音訊連結'));
+                        reject(new Error(parsed.text || '解析結果無有效網址'));
                     }
                 } catch (e) {
-                    reject(e);
+                    reject(new Error('JSON 回應解析錯誤'));
                 }
             });
         });
 
         req.on('error', (e) => reject(e));
-        req.write(JSON.stringify({
-            url: `https://www.youtube.com/watch?v=${videoId}`,
-            isAudioOnly: true
-        }));
+        req.on('timeout', () => { req.destroy(); reject(new Error('連線逾時')); });
+        req.write(postData);
         req.end();
     });
 }
@@ -236,7 +263,7 @@ async function runAudioCoreJob(task, next) {
 
         } catch (err) {
             console.error('第三方音訊解析失敗:', err);
-            updateJob(jobId, { status: 'error', error: 'YouTube 音訊擷取失敗 (第三方 API 拒絕回應)：' + err.message });
+            updateJob(jobId, { status: 'error', error: 'YouTube 音訊擷取失敗：' + err.message });
             if (audioFile) cleanupFiles(audioFile.path, tempMp4Path);
             return next();
         }
