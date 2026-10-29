@@ -4,6 +4,7 @@ const ffmpeg = require('fluent-ffmpeg');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
 const { google } = require('googleapis');
 
 const app = express();
@@ -64,15 +65,45 @@ function processQueue() {
     });
 }
 
-app.get('/auth/url', (req, res) => {
-    const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-    const authUrl = oauth2Client.generateAuthUrl({
-        access_type: 'offline',
-        prompt: 'consent',
-        scope: ['https://www.googleapis.com/auth/youtube.upload', 'https://www.googleapis.com/auth/youtube.readonly']
+// 輔助函式：透過第三方 API 繞過機房 429 取得 YouTube 純音訊直鏈
+async function getAudioUrlFromThirdParty(videoId) {
+    return new Promise((resolve, reject) => {
+        // 使用 Cobalt / Third-party API 解析音訊
+        const options = {
+            hostname: 'cobalt-api.kwiatek.xyz', // 開源免費無 429 機房限制之解析節點
+            path: '/',
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            }
+        };
+
+        const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', (chunk) => data += chunk);
+            res.on('end', () => {
+                try {
+                    const parsed = JSON.parse(data);
+                    if (parsed.url) {
+                        resolve(parsed.url);
+                    } else {
+                        reject(new Error('無法取得音訊連結'));
+                    }
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        });
+
+        req.on('error', (e) => reject(e));
+        req.write(JSON.stringify({
+            url: `https://www.youtube.com/watch?v=${videoId}`,
+            isAudioOnly: true
+        }));
+        req.end();
     });
-    res.json({ url: authUrl });
-});
+}
 
 app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 10 }]), (req, res) => {
     try {
@@ -178,20 +209,17 @@ async function runAudioCoreJob(task, next) {
 
     if (sourceType === 'youtube') {
         try {
-            // 透過官方 API 通道發起帶 Authentication Header 的影音串流請求
-            const streamUrl = `https://www.youtube.com/watch?v=${videoId}`;
+            console.log(`[${jobId}] 正在透過第三方 API 繞過機房 IP 解析音訊...`);
+            const directAudioUrl = await getAudioUrlFromThirdParty(videoId);
+
             let command = ffmpeg();
             activeCommand = command;
 
             command
                 .input(imageFile.path)
                 .inputOptions(['-loop 1'])
-                .input(streamUrl)
-                .inputOptions([
-                    `-ss ${startTime}`,
-                    `-to ${endTime}`,
-                    `-headers`, `Authorization: Bearer ${accessToken}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n`
-                ])
+                .input(directAudioUrl)
+                .inputOptions([`-ss ${startTime}`, `-to ${endTime}`])
                 .videoCodec('libx264')
                 .size('480x270')
                 .fps(1)
@@ -207,8 +235,8 @@ async function runAudioCoreJob(task, next) {
                 .run();
 
         } catch (err) {
-            console.error('API 授權存取失敗:', err);
-            updateJob(jobId, { status: 'error', error: 'YouTube 音訊擷取失敗：' + err.message });
+            console.error('第三方音訊解析失敗:', err);
+            updateJob(jobId, { status: 'error', error: 'YouTube 音訊擷取失敗 (第三方 API 拒絕回應)：' + err.message });
             if (audioFile) cleanupFiles(audioFile.path, tempMp4Path);
             return next();
         }
