@@ -1,250 +1,220 @@
-const express = require('express');
-const multer = require('multer');
-const ffmpeg = require('fluent-ffmpeg');
-const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
-const { PassThrough } = require('stream');
-const play = require('play-dl'); // 使用 play-dl 繞過 429 封鎖
-const { google } = require('googleapis');
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Audio & Image to Video Generator (Auto Close Auth)</title>
+    <style>
+        * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif; background: #f2f2f7; margin: 0; padding: 16px; display: flex; justify-content: center; }
+        .container { background: white; max-width: 500px; width: 100%; padding: 20px; border-radius: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
+        h2 { text-align: center; margin-bottom: 20px; color: #1c1c1e; font-size: 20px; }
+        .form-group { margin-bottom: 16px; }
+        label { display: block; font-weight: 600; margin-bottom: 6px; color: #3a3a3c; font-size: 14px; }
+        input[type="text"], textarea, select { width: 100%; padding: 12px; border: 1px solid #c7c7cc; border-radius: 10px; font-size: 15px; background: #fff; appearance: none; }
+        input[type="file"] { display: block; width: 100%; padding: 10px; border: 1px solid #c7c7cc; border-radius: 10px; background: #f2f2f7; font-size: 14px; }
+        button { width: 100%; padding: 14px; background: #007aff; color: white; border: none; border-radius: 10px; font-size: 16px; font-weight: 600; cursor: pointer; transition: opacity 0.2s; margin-top: 10px; }
+        button:active { opacity: 0.7; }
+        button:disabled { background: #aeaeb2; cursor: not-allowed; }
+        .btn-auth { background: #34c759; margin-bottom: 16px; }
+        .auth-status { text-align: center; font-size: 14px; color: #34c759; font-weight: 600; margin-bottom: 12px; padding: 10px; background: #e8f8ee; border-radius: 10px; display: none; }
+        .source-toggle { display: flex; gap: 8px; margin-bottom: 12px; }
+        .toggle-btn { flex: 1; padding: 8px; font-size: 13px; text-align: center; border: 1px solid #007aff; border-radius: 8px; color: #007aff; cursor: pointer; font-weight: 600; }
+        .toggle-btn.active { background: #007aff; color: white; }
+        .job-card { background: #e5f1ff; border: 1px solid #007aff; padding: 12px; border-radius: 10px; margin-top: 12px; font-size: 13px; color: #004085; display: none; }
+        .task-list { margin-top: 16px; }
+        .task-item { background: #f2f2f7; border: 1px solid #d1d1d6; border-radius: 10px; padding: 12px; margin-bottom: 8px; font-size: 13px; }
+        .task-name { font-weight: 600; color: #1c1c1e; margin-bottom: 4px; word-break: break-all; }
+        .task-status { color: #007aff; font-weight: 500; }
+        .time-box { display: flex; gap: 8px; }
+    </style>
+</head>
+<body>
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+<div class="container">
+    <h2>🎵 音源+封面圖（自動關閉授權版）</h2>
 
-const CLIENT_ID = '124484081362-42ffam7ts867htags708jsb4rg88vl4e.apps.googleusercontent.com';
-const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
-const REDIRECT_URI = 'https://ffmpeg-backend-72s6.onrender.com/auth/callback';
+    <button id="authBtn" class="btn-auth">🔑 第一步：連結 YouTube 帳號</button>
+    <div id="authSuccessMsg" class="auth-status">✅ 已連結 YouTube 帳號 <a href="#" id="reAuthLink" style="font-size:12px; color:#007aff; margin-left:8px;">重新連結</a></div>
 
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+    <div class="form-group">
+        <label>1. 選擇靜態封面圖片 (JPG / PNG)</label>
+        <input type="file" id="imageInput" accept="image/*">
+    </div>
 
-const jobsFilePath = path.join(__dirname, 'jobs.json');
+    <div class="form-group">
+        <label>2. 選擇音源模式</label>
+        <div class="source-toggle">
+            <div class="toggle-btn active" id="btnModeFile">📁 本地音檔 (可多選)</div>
+            <div class="toggle-btn" id="btnModeYt">🔗 YouTube 區間</div>
+        </div>
+    </div>
 
-function getJobs() {
-    if (!fs.existsSync(jobsFilePath)) return {};
-    try { return JSON.parse(fs.readFileSync(jobsFilePath, 'utf8')); } catch (e) { return {}; }
-}
+    <div id="sectionFile">
+        <div class="form-group">
+            <label>3. 選擇音訊檔案 (按住可多選 MP3/WAV)</label>
+            <input type="file" id="audioInput" accept="audio/*, .mp3, .wav, .m4a" multiple>
+        </div>
+    </div>
 
-function updateJob(jobId, data) {
-    const jobs = getJobs();
-    jobs[jobId] = { ...(jobs[jobId] || {}), ...data, updatedAt: new Date() };
-    fs.writeFileSync(jobsFilePath, JSON.stringify(jobs, null, 2));
-}
+    <div id="sectionYt" style="display: none;">
+        <div class="form-group">
+            <label>3. YouTube 影片網址 (支援不公開)</label>
+            <input type="text" id="ytUrlInput" placeholder="https://www.youtube.com/watch?v=...">
+        </div>
+        <div class="form-group">
+            <label>4. 截取時間區間 (hh:mm:ss)</label>
+            <div class="time-box">
+                <input type="text" id="startTimeInput" placeholder="開始 (00:00:00)" value="00:00:00">
+                <input type="text" id="endTimeInput" placeholder="結束 (00:05:00)" value="00:05:00">
+            </div>
+        </div>
+    </div>
 
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadDir),
-    filename: (req, file, cb) => {
-        const ext = path.extname(file.originalname) || (file.fieldname === 'image' ? '.jpg' : '.mp3');
-        cb(null, `${file.fieldname}_${Date.now()}_${Math.round(Math.random() * 1E9)}${ext}`);
+    <div class="form-group">
+        <label>5. YouTube 影片標題</label>
+        <input type="text" id="ytTitle" value="My Audio Track">
+    </div>
+
+    <div class="form-group">
+        <label>6. YouTube 影片說明</label>
+        <textarea id="ytDescription" rows="2">Uploaded with Web App</textarea>
+    </div>
+
+    <div class="form-group">
+        <label>7. 隱私設定</label>
+        <select id="ytPrivacy">
+            <option value="private" selected>私人 (Private)</option>
+            <option value="unlisted">不公開 (Unlisted)</option>
+            <option value="public">公開 (Public)</option>
+        </select>
+    </div>
+
+    <button id="convertBtn">🚀 提交至雲端背景佇列</button>
+
+    <div class="job-card" id="jobCard">
+        📱 <b>背景佇列已啟動！</b><br>
+        您可以自由關閉網頁或切換 App，系統將自動壓碼發布。
+    </div>
+
+    <div class="task-list" id="taskList"></div>
+</div>
+
+<script>
+    const RENDER_BACKEND_URL = 'https://ffmpeg-backend-72s6.onrender.com';
+    const CLIENT_ID = '124484081362-42ffam7ts867htags708jsb4rg88vl4e.apps.googleusercontent.com';
+    const SCOPE = 'https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly';
+
+    // 關鍵修復：如果是在 OAuth 彈出視窗內，拿到 Token 後儲存並自動關閉視窗！
+    if (window.location.hash.includes('access_token')) {
+        const hash = window.location.hash.substring(1);
+        const params = new URLSearchParams(hash);
+        const token = params.get('access_token');
+        if (token) {
+            localStorage.setItem('yt_access_token', token);
+            window.close(); // 自動關閉視窗
+        }
     }
-});
 
-const upload = multer({ storage: storage });
+    let userAccessToken = localStorage.getItem('yt_access_token') || null;
+    let pollTimer = null;
+    let currentMode = 'file';
 
-const queue = [];
-let isProcessing = false;
+    const btnModeFile = document.getElementById('btnModeFile');
+    const btnModeYt = document.getElementById('btnModeYt');
+    const sectionFile = document.getElementById('sectionFile');
+    const sectionYt = document.getElementById('sectionYt');
+    const authBtn = document.getElementById('authBtn');
+    const authSuccessMsg = document.getElementById('authSuccessMsg');
+    const reAuthLink = document.getElementById('reAuthLink');
+    const convertBtn = document.getElementById('convertBtn');
+    const jobCard = document.getElementById('jobCard');
+    const taskList = document.getElementById('taskList');
 
-function processQueue() {
-    if (isProcessing || queue.length === 0) return;
-    isProcessing = true;
-    const task = queue.shift();
-    runMemoryControlledJob(task, () => {
-        isProcessing = false;
-        processQueue();
+    btnModeFile.addEventListener('click', () => {
+        currentMode = 'file';
+        btnModeFile.classList.add('active');
+        btnModeYt.classList.remove('active');
+        sectionFile.style.display = 'block';
+        sectionYt.style.display = 'none';
     });
-}
 
-app.get('/auth/url', (req, res) => {
-    const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-    const authUrl = oauth2Client.generateAuthUrl({
-        access_type: 'offline',
-        prompt: 'consent',
-        scope: ['https://www.googleapis.com/auth/youtube.upload', 'https://www.googleapis.com/auth/youtube.readonly']
+    btnModeYt.addEventListener('click', () => {
+        currentMode = 'youtube';
+        btnModeYt.classList.add('active');
+        btnModeFile.classList.remove('active');
+        sectionFile.style.display = 'none';
+        sectionYt.style.display = 'block';
     });
-    res.json({ url: authUrl });
-});
 
-app.get('/auth/callback', async (req, res) => {
-    const code = req.query.code;
-    if (!code) return res.status(400).send('缺少 Authorization Code');
-    try {
-        const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-        const { tokens } = await oauth2Client.getToken(code);
-        res.send(`
-            <script>
-                if (window.opener) {
-                    window.opener.postMessage({ type: 'OAUTH_SUCCESS', tokens: ${JSON.stringify(tokens)} }, '*');
-                    window.close();
-                } else { document.write('授權成功！請返回原頁面。'); }
-            </script>
-        `);
-    } catch (err) {
-        res.status(500).send('授權失敗：' + err.message);
-    }
-});
-
-app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 10 }]), (req, res) => {
-    try {
-        if (!req.files || !req.files['image']) return res.status(400).send('缺少靜態圖片檔案');
-
-        const refreshToken = req.body.refreshToken;
-        const accessToken = req.body.accessToken;
-        if (!refreshToken && !accessToken) return res.status(400).send('未提供有效的 YouTube 授權 Token');
-
-        const imageFile = req.files['image'][0];
-        const sourceType = req.body.sourceType || 'file';
-        const ytTitle = req.body.title || 'My Audio Track';
-        const ytDescription = req.body.description || 'Uploaded with Web App';
-        const ytPrivacy = req.body.privacy || 'private';
-
-        const createdJobIds = [];
-
-        if (sourceType === 'youtube') {
-            const ytUrl = req.body.ytUrl;
-            const startTime = req.body.startTime || '00:00:00';
-            const endTime = req.body.endTime || '00:05:00';
-
-            if (!ytUrl) return res.status(400).send('缺少 YouTube 影片網址');
-
-            const jobId = `job_${Date.now()}_yt`;
-            updateJob(jobId, { status: 'queued', progress: '排隊中...', fileName: `YouTube 區間 (${startTime} ~ ${endTime})`, videoUrl: null, error: null });
-            createdJobIds.push(jobId);
-
-            queue.push({
-                jobId, imageFile, sourceType: 'youtube', ytUrl, startTime, endTime,
-                refreshToken, accessToken, ytTitle, ytDescription, ytPrivacy
-            });
-
+    function updateAuthUI() {
+        if (userAccessToken) {
+            authBtn.style.display = 'none';
+            authSuccessMsg.style.display = 'block';
         } else {
-            const audioFiles = req.files['audio'];
-            if (!audioFiles || audioFiles.length === 0) return res.status(400).send('缺少音訊檔案');
-
-            audioFiles.forEach((audioFile, index) => {
-                const jobId = `job_${Date.now()}_${index + 1}`;
-                const titleWithIndex = audioFiles.length > 1 ? `${ytTitle} (${index + 1}/${audioFiles.length})` : ytTitle;
-
-                updateJob(jobId, { status: 'queued', progress: '排隊中...', fileName: audioFile.originalname, videoUrl: null, error: null });
-                createdJobIds.push(jobId);
-
-                queue.push({
-                    jobId, imageFile, sourceType: 'file', audioFile,
-                    refreshToken, accessToken, ytTitle: titleWithIndex, ytDescription, ytPrivacy
-                });
-            });
+            authBtn.style.display = 'block';
+            authSuccessMsg.style.display = 'none';
         }
-
-        res.json({ success: true, jobIds: createdJobIds });
-        processQueue();
-
-    } catch (err) {
-        console.error('[伺服器例外錯誤]:', err);
-        if (!res.headersSent) res.status(500).send('伺服器錯誤：' + err.message);
     }
-});
+    updateAuthUI();
 
-app.get('/status/batch', (req, res) => {
-    const idsParam = req.query.ids;
-    if (!idsParam) return res.status(400).json({ error: '缺少 ids 參數' });
-    const jobIds = idsParam.split(',');
-    const jobs = getJobs();
-    const result = {};
-    jobIds.forEach(id => { if (jobs[id]) result[id] = jobs[id]; });
-    res.json(result);
-});
-
-async function runMemoryControlledJob(task, next) {
-    const { jobId, imageFile, sourceType, audioFile, ytUrl, startTime, endTime, refreshToken, accessToken, ytTitle, ytDescription, ytPrivacy } = task;
-
-    console.log(`[佇列任務開始] JobID: ${jobId}, 模式: ${sourceType}`);
-    updateJob(jobId, { status: 'processing', progress: '00:00:00' });
-
-    const auth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-    auth.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
-
-    const videoStream = new PassThrough({ highWaterMark: 1024 * 1024 });
-    const youtube = google.youtube({ version: 'v3', auth: auth });
-
-    const uploadPromise = youtube.videos.insert({
-        part: ['snippet', 'status'],
-        requestBody: {
-            snippet: { title: ytTitle, description: ytDescription, categoryId: '10' },
-            status: { privacyStatus: ytPrivacy }
-        },
-        media: { body: videoStream }
+    reAuthLink.addEventListener('click', (e) => {
+        e.preventDefault();
+        localStorage.removeItem('yt_access_token');
+        userAccessToken = null;
+        updateAuthUI();
+        triggerAuth();
     });
 
-    let command = ffmpeg();
+    function triggerAuth() {
+        let redirectUri = window.location.href.split('#')[0].split('?')[0];
+        if (redirectUri.endsWith('/')) redirectUri = redirectUri.slice(0, -1);
 
-    if (sourceType === 'youtube') {
-        try {
-            // 使用 play-dl 解析並獲取音訊串流（帶有模擬用戶端的防封鎖機制）
-            const source = await play.stream(ytUrl, { quality: 2 }); // quality 2 為純音訊最佳畫質
+        const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?` +
+            `client_id=${encodeURIComponent(CLIENT_ID)}` +
+            `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+            `&response_type=token` +
+            `&scope=${encodeURIComponent(SCOPE)}` +
+            `&prompt=consent`;
 
-            command
-                .input(imageFile.path)
-                .inputOptions(['-loop 1'])
-                .input(source.stream)
-                .inputOptions([`-ss ${startTime}`, `-to ${endTime}`])
-                .videoCodec('libx264')
-                .size('480x270')
-                .fps(1)
-                .outputOptions(['-preset ultrafast', '-tune stillimage', '-pix_fmt yuv420p', '-threads 1', '-f mp4', '-movflags frag_keyframe+empty_moov'])
-                .audioCodec('aac')
-                .audioBitrate('128k')
-                .on('progress', p => p.timemark && updateJob(jobId, { progress: p.timemark }))
-                .on('end', async () => handleUploadSuccess(uploadPromise, jobId, next))
-                .on('error', err => handleUploadError(err, jobId, next))
-                .pipe(videoStream, { end: true });
+        const popup = window.open(authUrl, 'GoogleAuth', 'width=500,height=600');
+        
+        // 輪詢檢測 LocalStorage，當彈窗寫入 token 關閉後立刻自動切換 UI
+        const checkTimer = setInterval(() => {
+            const storedToken = localStorage.getItem('yt_access_token');
+            if (storedToken) {
+                userAccessToken = storedToken;
+                updateAuthUI();
+                clearInterval(checkTimer);
+                if (popup && !popup.closed) popup.close();
+            }
+        }, 500);
+    }
 
-        } catch (err) {
-            console.error('play-dl 錯誤:', err);
-            updateJob(jobId, { status: 'error', error: 'YouTube 音訊擷取失敗：' + err.message });
-            return next();
+    authBtn.addEventListener('click', triggerAuth);
+
+    const savedJobIds = JSON.parse(localStorage.getItem('current_batch_ids') || '[]');
+    if (savedJobIds.length > 0) startPolling(savedJobIds);
+
+    convertBtn.addEventListener('click', () => {
+        const imgFile = document.getElementById('imageInput').files[0];
+        if (!imgFile) { alert('請選擇圖片！'); return; }
+        if (!userAccessToken) { alert('請先點擊最上方的「第一步：連結 YouTube 帳號」進行授權！'); return; }
+
+        const formData = new FormData();
+        formData.append('image', imgFile);
+        formData.append('sourceType', currentMode);
+
+        if (currentMode === 'file') {
+            const audioFiles = document.getElementById('audioInput').files;
+            if (audioFiles.length === 0) { alert('請選擇至少一個音檔！'); return; }
+            for (let i = 0; i < audioFiles.length; i++) formData.append('audio', audioFiles[i]);
+        } else {
+            const ytUrl = document.getElementById('ytUrlInput').value;
+            if (!ytUrl) { alert('請輸入 YouTube 網址！'); return; }
+            formData.append('ytUrl', ytUrl);
+            formData.append('startTime', document.getElementById('startTimeInput').value || '00:00:00');
+            formData.append('endTime', document.getElementById('endTimeInput').value || '00:05:00');
         }
-    } else {
-        command
-            .input(imageFile.path)
-            .inputOptions(['-loop 1'])
-            .input(audioFile.path)
-            .videoCodec('libx264')
-            .size('480x270')
-            .fps(1)
-            .outputOptions(['-preset ultrafast', '-tune stillimage', '-pix_fmt yuv420p', '-shortest', '-threads 1', '-f mp4', '-movflags frag_keyframe+empty_moov'])
-            .audioCodec('copy')
-            .on('progress', p => p.timemark && updateJob(jobId, { progress: p.timemark }))
-            .on('end', async () => {
-                cleanupAudio(audioFile.path);
-                handleUploadSuccess(uploadPromise, jobId, next);
-            })
-            .on('error', err => {
-                cleanupAudio(audioFile.path);
-                handleUploadError(err, jobId, next);
-            })
-            .pipe(videoStream, { end: true });
-    }
-}
 
-async function handleUploadSuccess(uploadPromise, jobId, next) {
-    updateJob(jobId, { progress: '正在完成 YouTube 發布...' });
-    try {
-        const uploadRes = await uploadPromise;
-        updateJob(jobId, { status: 'completed', videoUrl: `https://youtu.be/${uploadRes.data.id}` });
-    } catch (ytErr) {
-        updateJob(jobId, { status: 'error', error: 'YouTube 上傳失敗：' + (ytErr.message || '授權失效') });
-    } finally {
-        next();
-    }
-}
-
-function handleUploadError(err, jobId, next) {
-    updateJob(jobId, { status: 'error', error: '轉碼失敗：' + err.message });
-    next();
-}
-
-function cleanupAudio(audioPath) {
-    if (audioPath && fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
-}
-
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
+        formData.append('accessToken', user
