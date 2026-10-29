@@ -4,7 +4,6 @@ const ffmpeg = require('fluent-ffmpeg');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
 const { google } = require('googleapis');
 
 const app = express();
@@ -35,79 +34,12 @@ const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, uploadDir),
     filename: (req, file, cb) => {
         const ext = path.extname(file.originalname) || (file.fieldname === 'image' ? '.jpg' : '.mp3');
-        cb(null, `${file.fieldname}_${Date.now()}_${Math.round(Math.random() * 1E9)}${ext}`);
-    }
-});
-
-const upload = multer({ storage: storage });
-
-const queue = [];
-let isProcessing = false;
-let activeCommand = null;
-let currentProcessingJobId = null;
-
-function processQueue() {
-    if (isProcessing || queue.length === 0) return;
-    isProcessing = true;
-    const task = queue.shift();
-
-    const jobs = getJobs();
-    if (jobs[task.jobId] && jobs[task.jobId].status === 'cancelled') {
-        isProcessing = false;
-        return processQueue();
-    }
-
-    runAudioCoreJob(task, () => {
-        isProcessing = false;
-        activeCommand = null;
-        currentProcessingJobId = null;
-        processQueue();
-    });
-}
-
-app.get('/auth/url', (req, res) => {
-    const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-    const authUrl = oauth2Client.generateAuthUrl({
-        access_type: 'offline',
-        prompt: 'consent',
-        scope: ['https://www.googleapis.com/auth/youtube.upload']
-    });
-    res.json({ url: authUrl });
-});
-
-app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 10 }]), (req, res) => {
-    try {
-        if (!req.files || !req.files['image']) return res.status(400).send('缺少靜態圖片檔案');
-
-        const accessToken = req.body.accessToken;
-        if (!accessToken) return res.status(400).send('未提供有效的 YouTube 授權 Token');
-
-        const imageFile = req.files['image'][0];
-        const sourceType = req.body.sourceType || 'file';
-        const ytTitle = req.body.title || 'My Audio Track';
-        const ytDescription = req.body.description || 'Uploaded with Web App';
-        const ytPrivacy = req.body.privacy || 'private';
-
-        const createdJobIds = [];
-
-        if (sourceType === 'youtube') {
-            let ytUrl = req.body.ytUrl;
-            const startTime = req.body.startTime || '00:00:00';
-            const endTime = req.body.endTime || '00:05:00';
-
-            if (!ytUrl) return res.status(400).send('缺少 YouTube 影片網址');
-
-            if (ytUrl.includes('/live/')) {
-                const videoId = ytUrl.split('/live/')[1].split('?')[0];
-                ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
-            }
-
-            const jobId = `job_${Date.now()}_yt`;
-            updateJob(jobId, { status: 'queued', progress: '排隊中...', fileName: `YouTube 音訊區間 (${startTime} ~ ${endTime})`, videoUrl: null, error: null });
+        cb(null, `${file.fieldname}_${Date.now()}_${Math.round(Math.random() * 1E9)}${ext}`); } });  const upload = multer({ storage: storage });  const queue = []; let isProcessing = false; let activeCommand = null; let currentProcessingJobId = null;  function processQueue() { if (isProcessing \vert{}\vert{} queue.length === 0) return; isProcessing = true; const task = queue.shift();  const jobs = getJobs(); if (jobs[task.jobId] && jobs[task.jobId].status === 'cancelled') { isProcessing = false; return processQueue(); }  runAudioCoreJob(task, () => { isProcessing = false; activeCommand = null; currentProcessingJobId = null; processQueue(); }); }  app.get('/auth/url', (req, res) => { const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI); const authUrl = oauth2Client.generateAuthUrl({ access_type: 'offline', prompt: 'consent', scope: ['https://www.googleapis.com/auth/youtube.upload', 'https://www.googleapis.com/auth/youtube.readonly'] }); res.json({ url: authUrl }); });  app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 10 }]), (req, res) => { try { if (!req.files \vert{}\vert{} !req.files['image']) return res.status(400).send('缺少靜態圖片檔案');  const accessToken = req.body.accessToken; if (!accessToken) return res.status(400).send('未提供有效的 YouTube 授權 Token');  const imageFile = req.files['image'][0]; const sourceType = req.body.sourceType \vert{}\vert{} 'file'; const ytTitle = req.body.title \vert{}\vert{} 'My Audio Track'; const ytDescription = req.body.description \vert{}\vert{} 'Uploaded with Web App'; const ytPrivacy = req.body.privacy \vert{}\vert{} 'private';  const createdJobIds = [];  if (sourceType === 'youtube') { let ytUrl = req.body.ytUrl; const startTime = req.body.startTime \vert{}\vert{} '00:00:00'; const endTime = req.body.endTime \vert{}\vert{} '00:05:00';  if (!ytUrl) return res.status(400).send('缺少 YouTube 影片網址');  let videoId = ''; if (ytUrl.includes('/live/')) { videoId = ytUrl.split('/live/')[1].split('?')[0]; } else if (ytUrl.includes('v=')) { videoId = ytUrl.split('v=')[1].split('&')[0]; } else if (ytUrl.includes('youtu.be/')) { videoId = ytUrl.split('youtu.be/')[1].split('?')[0]; }  if (!videoId) return res.status(400).send('無法解析有效的 Video ID');  const jobId = `job_${Date.now()}_yt`;
+            updateJob(jobId, { status: 'queued', progress: '排隊中...', fileName: `YouTube 音訊區間 (${startTime} ~${endTime})`, videoUrl: null, error: null });
             createdJobIds.push(jobId);
 
             queue.push({
-                jobId, imageFile, sourceType: 'youtube', ytUrl, startTime, endTime,
+                jobId, imageFile, sourceType: 'youtube', videoId, startTime, endTime,
                 accessToken, ytTitle, ytDescription, ytPrivacy
             });
 
@@ -117,39 +49,7 @@ app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'aud
 
             audioFiles.forEach((audioFile, index) => {
                 const jobId = `job_${Date.now()}_${index + 1}`;
-                const titleWithIndex = audioFiles.length > 1 ? `${ytTitle} (${index + 1}/${audioFiles.length})` : ytTitle;
-
-                updateJob(jobId, { status: 'queued', progress: '排隊中...', fileName: audioFile.originalname, videoUrl: null, error: null });
-                createdJobIds.push(jobId);
-
-                queue.push({
-                    jobId, imageFile, sourceType: 'file', audioFile,
-                    accessToken, ytTitle: titleWithIndex, ytDescription, ytPrivacy
-                });
-            });
-        }
-
-        res.json({ success: true, jobIds: createdJobIds });
-        processQueue();
-
-    } catch (err) {
-        console.error('[伺服器例外錯誤]:', err);
-        if (!res.headersSent) res.status(500).send('伺服器錯誤：' + err.message);
-    }
-});
-
-app.post('/cancel/:jobId', (req, res) => {
-    const jobId = req.params.jobId;
-    updateJob(jobId, { status: 'cancelled', progress: '任務已被取消' });
-
-    const queueIndex = queue.findIndex(t => t.jobId === jobId);
-    if (queueIndex !== -1) queue.splice(queueIndex, 1);
-
-    if (currentProcessingJobId === jobId && activeCommand) {
-        try { activeCommand.kill('SIGKILL'); } catch (e) { console.error('Kill error:', e); }
-    }
-
-    res.json({ success: true, message: `任務 ${jobId} 已取消` });
+                const titleWithIndex = audioFiles.length > 1 ? `${ytTitle} (${index + 1}/${audioFiles.length})` : ytTitle;  updateJob(jobId, { status: 'queued', progress: '排隊中...', fileName: audioFile.originalname, videoUrl: null, error: null }); createdJobIds.push(jobId);  queue.push({ jobId, imageFile, sourceType: 'file', audioFile, accessToken, ytTitle: titleWithIndex, ytDescription, ytPrivacy }); }); }  res.json({ success: true, jobIds: createdJobIds }); processQueue();  } catch (err) { console.error('[伺服器例外錯誤]:', err); if (!res.headersSent) res.status(500).send('伺服器錯誤：' + err.message); } });  app.post('/cancel/:jobId', (req, res) => { const jobId = req.params.jobId; updateJob(jobId, { status: 'cancelled', progress: '任務已被取消' });  const queueIndex = queue.findIndex(t => t.jobId === jobId); if (queueIndex !== -1) queue.splice(queueIndex, 1);  if (currentProcessingJobId === jobId && activeCommand) { try { activeCommand.kill('SIGKILL'); } catch (e) { console.error('Kill error:', e); } }  res.json({ success: true, message: `任務 ${jobId} 已取消` });
 });
 
 app.get('/status/batch', (req, res) => {
@@ -163,133 +63,20 @@ app.get('/status/batch', (req, res) => {
 });
 
 async function runAudioCoreJob(task, next) {
-    const { jobId, imageFile, sourceType, audioFile, ytUrl, startTime, endTime, accessToken, ytTitle, ytDescription, ytPrivacy } = task;
+    const { jobId, imageFile, sourceType, audioFile, videoId, startTime, endTime, accessToken, ytTitle, ytDescription, ytPrivacy } = task;
 
     currentProcessingJobId = jobId;
     console.log(`[任務開始] JobID: ${jobId}, 模式: ${sourceType}`);
-    updateJob(jobId, { status: 'processing', progress: '00:00:00 (解析/壓碼中)' });
+    updateJob(jobId, { status: 'processing', progress: '00:00:00 (音訊處理中)' });
 
-    const tempMp4Path = path.join(uploadDir, `upload_${jobId}.mp4`);
-
-    if (sourceType === 'youtube') {
-        // 先透過 yt-dlp 解析取得真實音訊串流網址
-        const ytdlp = spawn('yt-dlp', ['-g', '-f', 'ba/b', ytUrl]);
-        let audioStreamUrl = '';
-        let errorLog = '';
-
-        ytdlp.stdout.on('data', (data) => { audioStreamUrl += data.toString().trim(); });
-        ytdlp.stderr.on('data', (data) => { errorLog += data.toString(); });
-
-        ytdlp.on('close', (code) => {
-            if (code !== 0 || !audioStreamUrl) {
-                console.error('yt-dlp 解析失敗:', errorLog);
-                updateJob(jobId, { status: 'error', error: 'YouTube 網址解析失敗，可能是不公開權限或受保護影片' });
-                return next();
-            }
-
-            // 取得真實媒體網址後，再交給 FFmpeg 進行區間裁切與圖片壓碼
+    const tempMp4Path = path.join(uploadDir, `upload_${jobId}.mp4`);  if (sourceType === 'youtube') { try { // 透過官方 API 通道發起帶 Authentication Header 的影音串流請求 const streamUrl = `https://www.youtube.com/watch?v=${videoId}`;
             let command = ffmpeg();
             activeCommand = command;
 
             command
                 .input(imageFile.path)
                 .inputOptions(['-loop 1'])
-                .input(audioStreamUrl)
-                .inputOptions([`-ss ${startTime}`, `-to ${endTime}`])
-                .videoCodec('libx264')
-                .size('480x270')
-                .fps(1)
-                .outputOptions(['-preset ultrafast', '-tune stillimage', '-pix_fmt yuv420p', '-threads 1'])
-                .audioCodec('aac')
-                .audioBitrate('128k')
-                .output(tempMp4Path)
-                .on('progress', (p) => {
-                    if (p.timemark) updateJob(jobId, { progress: `${p.timemark} (壓碼中)` });
-                })
-                .on('end', () => startYoutubeUpload(jobId, accessToken, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next))
-                .on('error', (err) => handleFfmpegError(err, jobId, audioFile, tempMp4Path, next))
-                .run();
-        });
-
-    } else {
-        // 本地音檔模式
-        let command = ffmpeg();
-        activeCommand = command;
-
-        command
-            .input(imageFile.path)
-            .inputOptions(['-loop 1'])
-            .input(audioFile.path)
-            .videoCodec('libx264')
-            .size('480x270')
-            .fps(1)
-            .outputOptions(['-preset ultrafast', '-tune stillimage', '-pix_fmt yuv420p', '-shortest', '-threads 1'])
-            .audioCodec('aac')
-            .audioBitrate('128k')
-            .output(tempMp4Path)
-            .on('progress', (p) => {
-                if (p.timemark) updateJob(jobId, { progress: `${p.timemark} (壓碼中)` });
-            })
-            .on('end', () => startYoutubeUpload(jobId, accessToken, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next))
-            .on('error', (err) => handleFfmpegError(err, jobId, audioFile, tempMp4Path, next))
-            .run();
-    }
-}
-
-async function startYoutubeUpload(jobId, accessToken, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next) {
-    const jobs = getJobs();
-    if (jobs[jobId] && jobs[jobId].status === 'cancelled') {
-        cleanupFiles(audioFile ? audioFile.path : null, tempMp4Path);
-        return next();
-    }
-
-    console.log(`[${jobId}] 壓碼完成！開始完整發布至 YouTube...`);
-    updateJob(jobId, { progress: '壓碼完成，正在發布至 YouTube...' });
-
-    try {
-        const auth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-        auth.setCredentials({ access_token: accessToken });
-        const youtube = google.youtube({ version: 'v3', auth: auth });
-
-        const res = await youtube.videos.insert({
-            part: ['snippet', 'status'],
-            requestBody: {
-                snippet: { title: ytTitle, description: ytDescription, categoryId: '10' },
-                status: { privacyStatus: ytPrivacy }
-            },
-            media: {
-                body: fs.createReadStream(tempMp4Path)
-            }
-        });
-
-        console.log(`[${jobId} 上傳成功] Video ID: ${res.data.id}`);
-        updateJob(jobId, { status: 'completed', videoUrl: `https://youtu.be/${res.data.id}` });
-
-    } catch (ytErr) {
-        console.error(`[${jobId} 上傳失敗]:`, ytErr);
-        updateJob(jobId, { status: 'error', error: 'YouTube 上傳失敗：' + (ytErr.message || '授權失效') });
-    } finally {
-        cleanupFiles(audioFile ? audioFile.path : null, tempMp4Path);
-        next();
-    }
-}
-
-function handleFfmpegError(err, jobId, audioFile, tempMp4Path, next) {
-    const jobs = getJobs();
-    if (jobs[jobId] && jobs[jobId].status === 'cancelled') {
-        console.log(`[${jobId}] 任務已手動中止`);
-    } else {
-        console.error(`[${jobId} FFmpeg 錯誤]:`, err);
-        updateJob(jobId, { status: 'error', error: '音訊處理失敗：' + err.message });
-    }
-    cleanupFiles(audioFile ? audioFile.path : null, tempMp4Path);
-    next();
-}
-
-function cleanupFiles(audioPath, mp4Path) {
-    if (audioPath && fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
-    if (mp4Path && fs.existsSync(mp4Path)) fs.unlinkSync(mp4Path);
-}
-
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
+                .input(streamUrl)
+                .inputOptions([
+                    `-ss ${startTime}`, `-to ${endTime}`,
+                    `-headers`, `Authorization: Bearer ${accessToken}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.
