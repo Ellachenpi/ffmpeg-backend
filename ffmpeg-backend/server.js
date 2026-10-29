@@ -4,7 +4,6 @@ const ffmpeg = require('fluent-ffmpeg');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
 const { google } = require('googleapis');
 
 const app = express();
@@ -65,61 +64,6 @@ function processQueue() {
     });
 }
 
-// 模擬線上 MP3 下載服務 API (透過多重第三方轉檔節點繞過 429 封鎖)
-async function getMp3StreamFromWebConverter(videoId) {
-    const targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
-    
-    // 多重第三方線上 MP3 轉換 API 備用陣列
-    const apis = [
-        `https://api.vevioz.com/api/button/mp3/${videoId}`,
-        `https://tubemp3.is/api/convert?url=${encodeURIComponent(targetUrl)}`
-    ];
-
-    for (const apiUrl of apis) {
-        try {
-            console.log(`[嘗試請求 MP3 轉換 API]: ${apiUrl}`);
-            const audioUrl = await fetchMp3DirectUrl(apiUrl, targetUrl);
-            if (audioUrl) return audioUrl;
-        } catch (err) {
-            console.warn(`[轉檔 API 失敗，切換下一組]:`, err.message);
-        }
-    }
-    throw new Error('線上 MP3 轉檔服務暫時無回應，請改用「📁 本地音檔」模式直接上傳發布');
-}
-
-function fetchMp3DirectUrl(apiUrl, targetUrl) {
-    return new Promise((resolve, reject) => {
-        const options = {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Referer': 'https://yout.com/'
-            },
-            timeout: 10000
-        };
-
-        https.get(apiUrl, options, (res) => {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => {
-                try {
-                    const mp3Match = data.match(/https?:\/\/[^"'\s]+\.mp3[^"'\s]*/i) || data.match(/href=["'](https?:\/\/[^"'\s]+mp3[^"'\s]*)["']/i);
-                    if (mp3Match && mp3Match[1]) {
-                        resolve(mp3Match[1]);
-                    } else if (data.includes('url')) {
-                        const parsed = JSON.parse(data);
-                        if (parsed.url) resolve(parsed.url);
-                        else reject(new Error('未回傳 MP3 網址'));
-                    } else {
-                        reject(new Error('未找到 MP3 直鏈'));
-                    }
-                } catch (e) {
-                    reject(new Error('解析回應失敗'));
-                }
-            });
-        }).on('error', err => reject(err));
-    });
-}
-
 app.get('/auth/url', (req, res) => {
     const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
     const authUrl = oauth2Client.generateAuthUrl({
@@ -143,52 +87,26 @@ app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'aud
         const ytDescription = req.body.description || 'Uploaded with Web App';
         const ytPrivacy = req.body.privacy || 'private';
 
-        const createdJobIds = [];
-
         if (sourceType === 'youtube') {
-            let ytUrl = req.body.ytUrl;
-            const startTime = req.body.startTime || '00:00:00';
-            const endTime = req.body.endTime || '00:05:00';
+            return res.status(400).send('因 YouTube 機房 IP 阻擋，請先下載音訊檔後，切換至「📁 本地音檔」模式直接上傳發布。');
+        }
 
-            if (!ytUrl) return res.status(400).send('缺少 YouTube 影片網址');
+        const createdJobIds = [];
+        const audioFiles = req.files['audio'];
+        if (!audioFiles || audioFiles.length === 0) return res.status(400).send('缺少音訊檔案');
 
-            let videoId = '';
-            if (ytUrl.includes('/live/')) {
-                videoId = ytUrl.split('/live/')[1].split('?')[0];
-            } else if (ytUrl.includes('v=')) {
-                videoId = ytUrl.split('v=')[1].split('&')[0];
-            } else if (ytUrl.includes('youtu.be/')) {
-                videoId = ytUrl.split('youtu.be/')[1].split('?')[0];
-            }
+        audioFiles.forEach((audioFile, index) => {
+            const jobId = `job_${Date.now()}_${index + 1}`;
+            const titleWithIndex = audioFiles.length > 1 ? `${ytTitle} (${index + 1}/${audioFiles.length})` : ytTitle;
 
-            if (!videoId) return res.status(400).send('無法解析有效的 Video ID');
-
-            const jobId = `job_${Date.now()}_yt`;
-            updateJob(jobId, { status: 'queued', progress: '排隊中...', fileName: `YouTube 音訊區間 (${startTime} ~ ${endTime})`, videoUrl: null, error: null });
+            updateJob(jobId, { status: 'queued', progress: '排隊中...', fileName: audioFile.originalname, videoUrl: null, error: null });
             createdJobIds.push(jobId);
 
             queue.push({
-                jobId, imageFile, sourceType: 'youtube', videoId, startTime, endTime,
-                accessToken, ytTitle, ytDescription, ytPrivacy
+                jobId, imageFile, audioFile,
+                accessToken, ytTitle: titleWithIndex, ytDescription, ytPrivacy
             });
-
-        } else {
-            const audioFiles = req.files['audio'];
-            if (!audioFiles || audioFiles.length === 0) return res.status(400).send('缺少音訊檔案');
-
-            audioFiles.forEach((audioFile, index) => {
-                const jobId = `job_${Date.now()}_${index + 1}`;
-                const titleWithIndex = audioFiles.length > 1 ? `${ytTitle} (${index + 1}/${audioFiles.length})` : ytTitle;
-
-                updateJob(jobId, { status: 'queued', progress: '排隊中...', fileName: audioFile.originalname, videoUrl: null, error: null });
-                createdJobIds.push(jobId);
-
-                queue.push({
-                    jobId, imageFile, sourceType: 'file', audioFile,
-                    accessToken, ytTitle: titleWithIndex, ytDescription, ytPrivacy
-                });
-            });
-        }
+        });
 
         res.json({ success: true, jobIds: createdJobIds });
         processQueue();
@@ -224,69 +142,33 @@ app.get('/status/batch', (req, res) => {
 });
 
 async function runAudioCoreJob(task, next) {
-    const { jobId, imageFile, sourceType, audioFile, videoId, startTime, endTime, accessToken, ytTitle, ytDescription, ytPrivacy } = task;
+    const { jobId, imageFile, audioFile, accessToken, ytTitle, ytDescription, ytPrivacy } = task;
 
     currentProcessingJobId = jobId;
-    console.log(`[任務開始] JobID: ${jobId}, 模式: ${sourceType}`);
-    updateJob(jobId, { status: 'processing', progress: '00:00:00 (音訊處理中)' });
+    console.log(`[任務開始] JobID: ${jobId}, 檔案: ${audioFile.originalname}`);
+    updateJob(jobId, { status: 'processing', progress: '00:00:00 (壓碼中)' });
 
     const tempMp4Path = path.join(uploadDir, `upload_${jobId}.mp4`);
+    let command = ffmpeg();
+    activeCommand = command;
 
-    if (sourceType === 'youtube') {
-        try {
-            console.log(`[${jobId}] 正在透過 MP3 轉換服務解析音訊...`);
-            const mp3AudioUrl = await getMp3StreamFromWebConverter(videoId);
-
-            let command = ffmpeg();
-            activeCommand = command;
-
-            command
-                .input(imageFile.path)
-                .inputOptions(['-loop 1'])
-                .input(mp3AudioUrl)
-                .inputOptions([`-ss ${startTime}`, `-to ${endTime}`])
-                .videoCodec('libx264')
-                .size('480x270')
-                .fps(1)
-                .outputOptions(['-preset ultrafast', '-tune stillimage', '-pix_fmt yuv420p', '-threads 1'])
-                .audioCodec('aac')
-                .audioBitrate('128k')
-                .output(tempMp4Path)
-                .on('progress', (p) => {
-                    if (p.timemark) updateJob(jobId, { progress: `${p.timemark} (壓碼中)` });
-                })
-                .on('end', () => startYoutubeUpload(jobId, accessToken, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next))
-                .on('error', (err) => handleFfmpegError(err, jobId, audioFile, tempMp4Path, next))
-                .run();
-
-        } catch (err) {
-            console.error('MP3 轉檔解析失敗:', err);
-            updateJob(jobId, { status: 'error', error: 'YouTube 音訊擷取失敗：' + err.message });
-            if (audioFile) cleanupFiles(audioFile.path, tempMp4Path);
-            return next();
-        }
-    } else {
-        let command = ffmpeg();
-        activeCommand = command;
-
-        command
-            .input(imageFile.path)
-            .inputOptions(['-loop 1'])
-            .input(audioFile.path)
-            .videoCodec('libx264')
-            .size('480x270')
-            .fps(1)
-            .outputOptions(['-preset ultrafast', '-tune stillimage', '-pix_fmt yuv420p', '-shortest', '-threads 1'])
-            .audioCodec('aac')
-            .audioBitrate('128k')
-            .output(tempMp4Path)
-            .on('progress', (p) => {
-                if (p.timemark) updateJob(jobId, { progress: `${p.timemark} (壓碼中)` });
-            })
-            .on('end', () => startYoutubeUpload(jobId, accessToken, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next))
-            .on('error', (err) => handleFfmpegError(err, jobId, audioFile, tempMp4Path, next))
-            .run();
-    }
+    command
+        .input(imageFile.path)
+        .inputOptions(['-loop 1'])
+        .input(audioFile.path)
+        .videoCodec('libx264')
+        .size('480x270')
+        .fps(1)
+        .outputOptions(['-preset ultrafast', '-tune stillimage', '-pix_fmt yuv420p', '-shortest', '-threads 1'])
+        .audioCodec('aac')
+        .audioBitrate('128k')
+        .output(tempMp4Path)
+        .on('progress', (p) => {
+            if (p.timemark) updateJob(jobId, { progress: `${p.timemark} (壓碼中)` });
+        })
+        .on('end', () => startYoutubeUpload(jobId, accessToken, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next))
+        .on('error', (err) => handleFfmpegError(err, jobId, audioFile, tempMp4Path, next))
+        .run();
 }
 
 async function startYoutubeUpload(jobId, accessToken, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next) {
