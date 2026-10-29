@@ -65,128 +65,71 @@ function processQueue() {
     });
 }
 
-// 包含 4 組活體公用節點的多重備用機制
-async function getAudioUrlFromThirdParty(videoId) {
+// 模擬線上 MP3 下載服務 API (透過多重第三方轉檔節點繞過 429 封鎖)
+async function getMp3StreamFromWebConverter(videoId) {
     const targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
-
-    // 1. 嘗試通過專業 YouTube 轉碼 API 節點 (Invidious API)
-    const invidiousInstances = [
-        'inv.nadeko.net',
-        'invidious.nerdvpn.de',
-        'invidious.drgns.space'
+    
+    // 多重第三方線上 MP3 轉換 API 備用陣列
+    const apis = [
+        `https://api.vevioz.com/api/button/mp3/${videoId}`,
+        `https://tubemp3.is/api/convert?url=${encodeURIComponent(targetUrl)}`
     ];
 
-    for (const host of invidiousInstances) {
+    for (const apiUrl of apis) {
         try {
-            console.log(`[嘗試 Invidious 節點]: ${host}`);
-            const streamUrl = await fetchInvidiousAudio(host, videoId);
-            if (streamUrl) return streamUrl;
+            console.log(`[嘗試請求 MP3 轉換 API]: ${apiUrl}`);
+            const audioUrl = await fetchMp3DirectUrl(apiUrl, targetUrl);
+            if (audioUrl) return audioUrl;
         } catch (err) {
-            console.warn(`[Invidious 節點 ${host} 失敗]:`, err.message);
+            console.warn(`[轉檔 API 失敗，切換下一組]:`, err.message);
         }
     }
-
-    // 2. 備用 Cobalt 多重自建節點
-    const cobaltInstances = [
-        'co.wuk.sh',
-        'cobalt.stream'
-    ];
-
-    for (const host of cobaltInstances) {
-        try {
-            console.log(`[嘗試 Cobalt 節點]: ${host}`);
-            const streamUrl = await fetchCobaltAudio(host, targetUrl);
-            if (streamUrl) return streamUrl;
-        } catch (err) {
-            console.warn(`[Cobalt 節點 ${host} 失敗]:`, err.message);
-        }
-    }
-
-    throw new Error('所有公用 API 節點均無法解析，建議使用「📁 本地音檔」模式直接上傳發布');
+    throw new Error('線上 MP3 轉檔服務暫時無回應，請改用「📁 本地音檔」模式直接上傳發布');
 }
 
-function fetchInvidiousAudio(hostname, videoId) {
+function fetchMp3DirectUrl(apiUrl, targetUrl) {
     return new Promise((resolve, reject) => {
         const options = {
-            hostname: hostname,
-            path: `/api/v1/videos/${videoId}`,
-            method: 'GET',
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
-            timeout: 8000
-        };
-
-        const req = https.request(options, (res) => {
-            let data = '';
-            res.on('data', (chunk) => data += chunk);
-            res.on('end', () => {
-                try {
-                    const parsed = JSON.parse(data);
-                    if (parsed.adaptiveFormats) {
-                        // 篩選出音訊 (audio/mp4 或 audio/webm)
-                        const audioFormat = parsed.adaptiveFormats.find(f => f.type && f.type.startsWith('audio/'));
-                        if (audioFormat && audioFormat.url) {
-                            return resolve(audioFormat.url);
-                        }
-                    }
-                    reject(new Error('未找到可用的音訊串流'));
-                } catch (e) {
-                    reject(new Error('回應非有效 JSON'));
-                }
-            });
-        });
-
-        req.on('error', (e) => reject(e));
-        req.on('timeout', () => { req.destroy(); reject(new Error('請求超時')); });
-        req.end();
-    });
-}
-
-function fetchCobaltAudio(hostname, targetUrl) {
-    return new Promise((resolve, reject) => {
-        const postData = JSON.stringify({
-            url: targetUrl,
-            downloadMode: 'audio',
-            audioFormat: 'mp3',
-            isAudioOnly: true
-        });
-
-        const options = {
-            hostname: hostname,
-            path: '/',
-            method: 'POST',
             headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Referer': 'https://yout.com/'
             },
-            timeout: 8000
+            timeout: 10000
         };
 
-        const req = https.request(options, (res) => {
+        https.get(apiUrl, options, (res) => {
             let data = '';
-            res.on('data', (chunk) => data += chunk);
+            res.on('data', chunk => data += chunk);
             res.on('end', () => {
                 try {
-                    const parsed = JSON.parse(data);
-                    if (parsed.url) {
-                        resolve(parsed.url);
-                    } else if (parsed.picker && parsed.picker.length > 0) {
-                        resolve(parsed.picker[0].url);
+                    // 匹配 HTML 或 JSON 中的 MP3 檔案直鏈 (.mp3)
+                    const mp3Match = data.match(/https?:\/\/[^"'\s]+\.mp3[^"'\s]*/i) || data.match(/href=["'](https?:\/\/[^"'\s]+mp3[^"'\s]*)["']/i);
+                    if (mp3Match && mp3Match[1]) {
+                        resolve(mp3Match[1]);
+                    } else if (data.includes('url')) {
+                        const parsed = JSON.parse(data);
+                        if (parsed.url) resolve(parsed.url);
+                        else reject(new Error('未回傳 MP3 網址'));
                     } else {
-                        reject(new Error(parsed.text || '解析結果無有效網址'));
+                        reject(new Error('未找到 MP3 直鏈'));
                     }
                 } catch (e) {
-                    reject(new Error('JSON 回應解析錯誤'));
+                    reject(new Error('解析回應失敗'));
                 }
             });
-        });
-
-        req.on('error', (e) => reject(e));
-        req.on('timeout', () => { req.destroy(); reject(new Error('請求超時')); });
-        req.write(postData);
-        req.end();
+        }).on('error', err => reject(err));
     });
 }
+
+app.get('/auth/url', (req, res) => {
+    const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
+    const authUrl = oauth2Client.generateAuthUrl({
+        access_type: 'offline',
+        prompt: 'consent',
+        scope: ['https://www.googleapis.com/auth/youtube.upload']
+    });
+    res.json({ url: authUrl });
+});
 
 app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 10 }]), (req, res) => {
     try {
@@ -292,8 +235,8 @@ async function runAudioCoreJob(task, next) {
 
     if (sourceType === 'youtube') {
         try {
-            console.log(`[${jobId}] 正在透過第三方 API 繞過機房 IP 解析音訊...`);
-            const directAudioUrl = await getAudioUrlFromThirdParty(videoId);
+            console.log(`[${jobId}] 正在透過 MP3 轉換服務解析音訊...`);
+            const mp3AudioUrl = await getMp3StreamFromWebConverter(videoId);
 
             let command = ffmpeg();
             activeCommand = command;
@@ -301,7 +244,7 @@ async function runAudioCoreJob(task, next) {
             command
                 .input(imageFile.path)
                 .inputOptions(['-loop 1'])
-                .input(directAudioUrl)
+                .input(mp3AudioUrl)
                 .inputOptions([`-ss ${startTime}`, `-to ${endTime}`])
                 .videoCodec('libx264')
                 .size('480x270')
@@ -318,7 +261,7 @@ async function runAudioCoreJob(task, next) {
                 .run();
 
         } catch (err) {
-            console.error('第三方音訊解析失敗:', err);
+            console.error('MP3 轉檔解析失敗:', err);
             updateJob(jobId, { status: 'error', error: 'YouTube 音訊擷取失敗：' + err.message });
             if (audioFile) cleanupFiles(audioFile.path, tempMp4Path);
             return next();
@@ -393,11 +336,7 @@ function handleFfmpegError(err, jobId, audioFile, tempMp4Path, next) {
         console.error(`[${jobId} FFmpeg 錯誤]:`, err);
         updateJob(jobId, { status: 'error', error: '音訊處理失敗：' + err.message });
     }
-    cleanupFiles(audioFile ? audioFile.path : null, tempMp4Path);
-    next();
-}
-
-function cleanupFiles(audioPath, mp4Path) {
+    cleanupFiles(audioPath, mp4Path) {
     if (audioPath && fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
     if (mp4Path && fs.existsSync(mp4Path)) fs.unlinkSync(mp4Path);
 }
