@@ -4,8 +4,8 @@ const ffmpeg = require('fluent-ffmpeg');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const play = require('play-dl');
 const { google } = require('googleapis');
+const https = require('https');
 
 const app = express();
 app.use(cors());
@@ -70,7 +70,7 @@ app.get('/auth/url', (req, res) => {
     const authUrl = oauth2Client.generateAuthUrl({
         access_type: 'offline',
         prompt: 'consent',
-        scope: ['https://www.googleapis.com/auth/youtube.upload']
+        scope: ['https://www.googleapis.com/auth/youtube.upload', 'https://www.googleapis.com/auth/youtube.readonly']
     });
     res.json({ url: authUrl });
 });
@@ -97,17 +97,24 @@ app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'aud
 
             if (!ytUrl) return res.status(400).send('缺少 YouTube 影片網址');
 
+            // 提取 Video ID (相容 live/ 與 watch?v=)
+            let videoId = '';
             if (ytUrl.includes('/live/')) {
-                const videoId = ytUrl.split('/live/')[1].split('?')[0];
-                ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+                videoId = ytUrl.split('/live/')[1].split('?')[0];
+            } else if (ytUrl.includes('v=')) {
+                videoId = ytUrl.split('v=')[1].split('&')[0];
+            } else if (ytUrl.includes('youtu.be/')) {
+                videoId = ytUrl.split('youtu.be/')[1].split('?')[0];
             }
+
+            if (!videoId) return res.status(400).send('無法解析 YouTube 影片 ID');
 
             const jobId = `job_${Date.now()}_yt`;
             updateJob(jobId, { status: 'queued', progress: '排隊中...', fileName: `YouTube 音訊區間 (${startTime} ~ ${endTime})`, videoUrl: null, error: null });
             createdJobIds.push(jobId);
 
             queue.push({
-                jobId, imageFile, sourceType: 'youtube', ytUrl, startTime, endTime,
+                jobId, imageFile, sourceType: 'youtube', videoId, startTime, endTime,
                 accessToken, ytTitle, ytDescription, ytPrivacy
             });
 
@@ -138,20 +145,15 @@ app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'aud
     }
 });
 
-// 手動取消任務 API
 app.post('/cancel/:jobId', (req, res) => {
     const jobId = req.params.jobId;
     updateJob(jobId, { status: 'cancelled', progress: '任務已被取消' });
 
-    // 從排隊佇列中移除
     const queueIndex = queue.findIndex(t => t.jobId === jobId);
     if (queueIndex !== -1) queue.splice(queueIndex, 1);
 
-    // 如果是正在執行的任務，殺掉 FFmpeg
     if (currentProcessingJobId === jobId && activeCommand) {
-        try {
-            activeCommand.kill('SIGKILL');
-        } catch (e) { console.error('Kill error:', e); }
+        try { activeCommand.kill('SIGKILL'); } catch (e) { console.error('Kill error:', e); }
     }
 
     res.json({ success: true, message: `任務 ${jobId} 已取消` });
@@ -168,10 +170,10 @@ app.get('/status/batch', (req, res) => {
 });
 
 async function runAudioCoreJob(task, next) {
-    const { jobId, imageFile, sourceType, audioFile, ytUrl, startTime, endTime, accessToken, ytTitle, ytDescription, ytPrivacy } = task;
+    const { jobId, imageFile, sourceType, audioFile, videoId, startTime, endTime, accessToken, ytTitle, ytDescription, ytPrivacy } = task;
 
     currentProcessingJobId = jobId;
-    console.log(`[音訊任務開始] JobID: ${jobId}, 模式: ${sourceType}`);
+    console.log(`[任務開始] JobID: ${jobId}, 模式: ${sourceType}`);
     updateJob(jobId, { status: 'processing', progress: '00:00:00 (音訊處理中)' });
 
     const tempMp4Path = path.join(uploadDir, `upload_${jobId}.mp4`);
@@ -180,13 +182,18 @@ async function runAudioCoreJob(task, next) {
 
     if (sourceType === 'youtube') {
         try {
-            const source = await play.stream(ytUrl, { quality: 2 });
+            // 使用帶有 Bearer OAuth Access Token 的串流 (防機房 429 封鎖)
+            const audioStreamUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
             command
                 .input(imageFile.path)
                 .inputOptions(['-loop 1'])
-                .input(source.stream)
-                .inputOptions([`-ss ${startTime}`, `-to ${endTime}`])
+                .input(audioStreamUrl)
+                .inputOptions([
+                    `-ss ${startTime}`,
+                    `-to ${endTime}`,
+                    `-headers`, `Authorization: Bearer ${accessToken}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n`
+                ])
                 .videoCodec('libx264')
                 .size('480x270')
                 .fps(1)
@@ -196,7 +203,7 @@ async function runAudioCoreJob(task, next) {
                 .output(tempMp4Path);
 
         } catch (err) {
-            console.error('play-dl 錯誤:', err);
+            console.error('音訊授權解析錯誤:', err);
             updateJob(jobId, { status: 'error', error: 'YouTube 音訊擷取失敗：' + err.message });
             if (audioFile) cleanupFiles(audioFile.path, tempMp4Path);
             return next();
