@@ -4,8 +4,6 @@ const ffmpeg = require('fluent-ffmpeg');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const { PassThrough } = require('stream');
-const play = require('play-dl'); // 使用 play-dl 繞過 429 封鎖
 const { google } = require('googleapis');
 
 const app = express();
@@ -49,7 +47,7 @@ function processQueue() {
     if (isProcessing || queue.length === 0) return;
     isProcessing = true;
     const task = queue.shift();
-    runMemoryControlledJob(task, () => {
+    runReliableJob(task, () => {
         isProcessing = false;
         processQueue();
     });
@@ -60,37 +58,17 @@ app.get('/auth/url', (req, res) => {
     const authUrl = oauth2Client.generateAuthUrl({
         access_type: 'offline',
         prompt: 'consent',
-        scope: ['https://www.googleapis.com/auth/youtube.upload', 'https://www.googleapis.com/auth/youtube.readonly']
+        scope: ['https://www.googleapis.com/auth/youtube.upload']
     });
     res.json({ url: authUrl });
-});
-
-app.get('/auth/callback', async (req, res) => {
-    const code = req.query.code;
-    if (!code) return res.status(400).send('缺少 Authorization Code');
-    try {
-        const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-        const { tokens } = await oauth2Client.getToken(code);
-        res.send(`
-            <script>
-                if (window.opener) {
-                    window.opener.postMessage({ type: 'OAUTH_SUCCESS', tokens: ${JSON.stringify(tokens)} }, '*');
-                    window.close();
-                } else { document.write('授權成功！請返回原頁面。'); }
-            </script>
-        `);
-    } catch (err) {
-        res.status(500).send('授權失敗：' + err.message);
-    }
 });
 
 app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 10 }]), (req, res) => {
     try {
         if (!req.files || !req.files['image']) return res.status(400).send('缺少靜態圖片檔案');
 
-        const refreshToken = req.body.refreshToken;
         const accessToken = req.body.accessToken;
-        if (!refreshToken && !accessToken) return res.status(400).send('未提供有效的 YouTube 授權 Token');
+        if (!accessToken) return res.status(400).send('未提供有效的 YouTube 授權 Token');
 
         const imageFile = req.files['image'][0];
         const sourceType = req.body.sourceType || 'file';
@@ -100,23 +78,7 @@ app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'aud
 
         const createdJobIds = [];
 
-        if (sourceType === 'youtube') {
-            const ytUrl = req.body.ytUrl;
-            const startTime = req.body.startTime || '00:00:00';
-            const endTime = req.body.endTime || '00:05:00';
-
-            if (!ytUrl) return res.status(400).send('缺少 YouTube 影片網址');
-
-            const jobId = `job_${Date.now()}_yt`;
-            updateJob(jobId, { status: 'queued', progress: '排隊中...', fileName: `YouTube 區間 (${startTime} ~ ${endTime})`, videoUrl: null, error: null });
-            createdJobIds.push(jobId);
-
-            queue.push({
-                jobId, imageFile, sourceType: 'youtube', ytUrl, startTime, endTime,
-                refreshToken, accessToken, ytTitle, ytDescription, ytPrivacy
-            });
-
-        } else {
+        if (sourceType === 'file') {
             const audioFiles = req.files['audio'];
             if (!audioFiles || audioFiles.length === 0) return res.status(400).send('缺少音訊檔案');
 
@@ -128,8 +90,8 @@ app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'aud
                 createdJobIds.push(jobId);
 
                 queue.push({
-                    jobId, imageFile, sourceType: 'file', audioFile,
-                    refreshToken, accessToken, ytTitle: titleWithIndex, ytDescription, ytPrivacy
+                    jobId, imageFile, audioFile,
+                    accessToken, ytTitle: titleWithIndex, ytDescription, ytPrivacy
                 });
             });
         }
@@ -153,97 +115,84 @@ app.get('/status/batch', (req, res) => {
     res.json(result);
 });
 
-async function runMemoryControlledJob(task, next) {
-    const { jobId, imageFile, sourceType, audioFile, ytUrl, startTime, endTime, refreshToken, accessToken, ytTitle, ytDescription, ytPrivacy } = task;
+function runReliableJob(task, next) {
+    const { jobId, imageFile, audioFile, accessToken, ytTitle, ytDescription, ytPrivacy } = task;
 
-    console.log(`[佇列任務開始] JobID: ${jobId}, 模式: ${sourceType}`);
-    updateJob(jobId, { status: 'processing', progress: '00:00:00' });
+    console.log(`[佇列任務開始] JobID: ${jobId}, 檔案: ${audioFile.originalname}`);
+    updateJob(jobId, { status: 'processing', progress: '00:00:00 (本地轉碼中)' });
 
-    const auth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-    auth.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
+    // 建立臨時 MP4 檔案路徑
+    const outputMp4Path = path.join(uploadDir, `output_${jobId}.mp4`);
 
-    const videoStream = new PassThrough({ highWaterMark: 1024 * 1024 });
-    const youtube = google.youtube({ version: 'v3', auth: auth });
+    let command = ffmpeg()
+        .input(imageFile.path)
+        .inputOptions(['-loop 1'])
+        .input(audioFile.path)
+        .videoCodec('libx264')
+        .size('480x270')
+        .fps(1)
+        .outputOptions([
+            '-preset ultrafast',
+            '-tune stillimage',
+            '-pix_fmt yuv420p',
+            '-shortest',
+            '-threads 1'
+        ])
+        .audioCodec('aac')
+        .audioBitrate('128k')
+        .output(outputMp4Path);
 
-    const uploadPromise = youtube.videos.insert({
-        part: ['snippet', 'status'],
-        requestBody: {
-            snippet: { title: ytTitle, description: ytDescription, categoryId: '10' },
-            status: { privacyStatus: ytPrivacy }
-        },
-        media: { body: videoStream }
-    });
+    command
+        .on('progress', (progress) => {
+            if (progress.timemark) {
+                updateJob(jobId, { progress: `${progress.timemark} (本地轉碼中)` });
+            }
+        })
+        .on('end', async () => {
+            console.log(`[${jobId}] 本地 MP4 壓碼成功！準備完整上傳 YouTube...`);
+            updateJob(jobId, { progress: '轉碼完成，正在完整上傳 YouTube...' });
 
-    let command = ffmpeg();
+            try {
+                const auth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
+                auth.setCredentials({ access_token: accessToken });
+                const youtube = google.youtube({ version: 'v3', auth: auth });
 
-    if (sourceType === 'youtube') {
-        try {
-            // 使用 play-dl 解析並獲取音訊串流（帶有模擬用戶端的防封鎖機制）
-            const source = await play.stream(ytUrl, { quality: 2 }); // quality 2 為純音訊最佳畫質
+                // 使用實體 ReadStream，確保上傳完完整整
+                const res = await youtube.videos.insert({
+                    part: ['snippet', 'status'],
+                    requestBody: {
+                        snippet: { title: ytTitle, description: ytDescription, categoryId: '10' },
+                        status: { privacyStatus: ytPrivacy }
+                    },
+                    media: {
+                        body: fs.createReadStream(outputMp4Path)
+                    }
+                });
 
-            command
-                .input(imageFile.path)
-                .inputOptions(['-loop 1'])
-                .input(source.stream)
-                .inputOptions([`-ss ${startTime}`, `-to ${endTime}`])
-                .videoCodec('libx264')
-                .size('480x270')
-                .fps(1)
-                .outputOptions(['-preset ultrafast', '-tune stillimage', '-pix_fmt yuv420p', '-threads 1', '-f mp4', '-movflags frag_keyframe+empty_moov'])
-                .audioCodec('aac')
-                .audioBitrate('128k')
-                .on('progress', p => p.timemark && updateJob(jobId, { progress: p.timemark }))
-                .on('end', async () => handleUploadSuccess(uploadPromise, jobId, next))
-                .on('error', err => handleUploadError(err, jobId, next))
-                .pipe(videoStream, { end: true });
+                console.log(`[${jobId} 上傳成功] Video ID: ${res.data.id}`);
+                updateJob(jobId, { status: 'completed', videoUrl: `https://youtu.be/${res.data.id}` });
 
-        } catch (err) {
-            console.error('play-dl 錯誤:', err);
-            updateJob(jobId, { status: 'error', error: 'YouTube 音訊擷取失敗：' + err.message });
-            return next();
-        }
-    } else {
-        command
-            .input(imageFile.path)
-            .inputOptions(['-loop 1'])
-            .input(audioFile.path)
-            .videoCodec('libx264')
-            .size('480x270')
-            .fps(1)
-            .outputOptions(['-preset ultrafast', '-tune stillimage', '-pix_fmt yuv420p', '-shortest', '-threads 1', '-f mp4', '-movflags frag_keyframe+empty_moov'])
-            .audioCodec('copy')
-            .on('progress', p => p.timemark && updateJob(jobId, { progress: p.timemark }))
-            .on('end', async () => {
-                cleanupAudio(audioFile.path);
-                handleUploadSuccess(uploadPromise, jobId, next);
-            })
-            .on('error', err => {
-                cleanupAudio(audioFile.path);
-                handleUploadError(err, jobId, next);
-            })
-            .pipe(videoStream, { end: true });
-    }
+            } catch (ytErr) {
+                console.error(`[${jobId} 上傳失敗]:`, ytErr);
+                updateJob(jobId, { status: 'error', error: 'YouTube 上傳失敗：' + (ytErr.message || '授權失效') });
+            } finally {
+                // 清除暫存檔
+                cleanupFiles(audioFile.path, outputMp4Path);
+                next();
+            }
+        })
+        .on('error', (err) => {
+            console.error(`[${jobId} FFmpeg 轉碼失敗]:`, err);
+            updateJob(jobId, { status: 'error', error: '轉碼失敗：' + err.message });
+            cleanupFiles(audioFile.path, outputMp4Path);
+            next();
+        })
+        .run();
 }
 
-async function handleUploadSuccess(uploadPromise, jobId, next) {
-    updateJob(jobId, { progress: '正在完成 YouTube 發布...' });
-    try {
-        const uploadRes = await uploadPromise;
-        updateJob(jobId, { status: 'completed', videoUrl: `https://youtu.be/${uploadRes.data.id}` });
-    } catch (ytErr) {
-        updateJob(jobId, { status: 'error', error: 'YouTube 上傳失敗：' + (ytErr.message || '授權失效') });
-    } finally {
-        next();
-    }
-}
-
-function handleUploadError(err, jobId, next) {
-    updateJob(jobId, { status: 'error', error: '轉碼失敗：' + err.message });
-    next();
-}
-
-function cleanupAudio(audioPath) {
-    if (audioPath && fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+function cleanupFiles(audioPath, mp4Path) {
+    if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+    if (fs.existsSync(mp4Path)) fs.unlinkSync(mp4Path);
 }
 
 const PORT = process.env.PORT || 10000;
