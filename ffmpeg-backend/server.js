@@ -43,13 +43,24 @@ const upload = multer({ storage: storage });
 
 const queue = [];
 let isProcessing = false;
+let activeCommand = null;
+let currentProcessingJobId = null;
 
 function processQueue() {
     if (isProcessing || queue.length === 0) return;
     isProcessing = true;
     const task = queue.shift();
+
+    const jobs = getJobs();
+    if (jobs[task.jobId] && jobs[task.jobId].status === 'cancelled') {
+        isProcessing = false;
+        return processQueue();
+    }
+
     runAudioCoreJob(task, () => {
         isProcessing = false;
+        activeCommand = null;
+        currentProcessingJobId = null;
         processQueue();
     });
 }
@@ -86,7 +97,6 @@ app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'aud
 
             if (!ytUrl) return res.status(400).send('缺少 YouTube 影片網址');
 
-            // 自動將 live/ 網址轉換為標準 ID
             if (ytUrl.includes('/live/')) {
                 const videoId = ytUrl.split('/live/')[1].split('?')[0];
                 ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
@@ -128,6 +138,25 @@ app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'aud
     }
 });
 
+// 手動取消任務 API
+app.post('/cancel/:jobId', (req, res) => {
+    const jobId = req.params.jobId;
+    updateJob(jobId, { status: 'cancelled', progress: '任務已被取消' });
+
+    // 從排隊佇列中移除
+    const queueIndex = queue.findIndex(t => t.jobId === jobId);
+    if (queueIndex !== -1) queue.splice(queueIndex, 1);
+
+    // 如果是正在執行的任務，殺掉 FFmpeg
+    if (currentProcessingJobId === jobId && activeCommand) {
+        try {
+            activeCommand.kill('SIGKILL');
+        } catch (e) { console.error('Kill error:', e); }
+    }
+
+    res.json({ success: true, message: `任務 ${jobId} 已取消` });
+});
+
 app.get('/status/batch', (req, res) => {
     const idsParam = req.query.ids;
     if (!idsParam) return res.status(400).json({ error: '缺少 ids 參數' });
@@ -141,15 +170,16 @@ app.get('/status/batch', (req, res) => {
 async function runAudioCoreJob(task, next) {
     const { jobId, imageFile, sourceType, audioFile, ytUrl, startTime, endTime, accessToken, ytTitle, ytDescription, ytPrivacy } = task;
 
+    currentProcessingJobId = jobId;
     console.log(`[音訊任務開始] JobID: ${jobId}, 模式: ${sourceType}`);
     updateJob(jobId, { status: 'processing', progress: '00:00:00 (音訊處理中)' });
 
     const tempMp4Path = path.join(uploadDir, `upload_${jobId}.mp4`);
     let command = ffmpeg();
+    activeCommand = command;
 
     if (sourceType === 'youtube') {
         try {
-            // 使用 play-dl 抓取純音訊串流
             const source = await play.stream(ytUrl, { quality: 2 });
 
             command
@@ -192,6 +222,12 @@ async function runAudioCoreJob(task, next) {
             }
         })
         .on('end', async () => {
+            const jobs = getJobs();
+            if (jobs[jobId] && jobs[jobId].status === 'cancelled') {
+                cleanupFiles(audioFile ? audioFile.path : null, tempMp4Path);
+                return next();
+            }
+
             console.log(`[${jobId}] 音訊封裝完成！開始發布至 YouTube...`);
             updateJob(jobId, { progress: '音訊處理完成，正在發布至 YouTube...' });
 
@@ -223,8 +259,13 @@ async function runAudioCoreJob(task, next) {
             }
         })
         .on('error', (err) => {
-            console.error(`[${jobId} FFmpeg 錯誤]:`, err);
-            updateJob(jobId, { status: 'error', error: '音訊處理失敗：' + err.message });
+            const jobs = getJobs();
+            if (jobs[jobId] && jobs[jobId].status === 'cancelled') {
+                console.log(`[${jobId}] 任務已手動中止`);
+            } else {
+                console.error(`[${jobId} FFmpeg 錯誤]:`, err);
+                updateJob(jobId, { status: 'error', error: '音訊處理失敗：' + err.message });
+            }
             cleanupFiles(audioFile ? audioFile.path : null, tempMp4Path);
             next();
         })
