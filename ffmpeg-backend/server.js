@@ -87,26 +87,41 @@ app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'aud
         const ytDescription = req.body.description || 'Uploaded with Web App';
         const ytPrivacy = req.body.privacy || 'private';
 
-        if (sourceType === 'youtube') {
-            return res.status(400).send('因 YouTube 機房 IP 阻擋，請先下載音訊檔後，切換至「📁 本地音檔」模式直接上傳發布。');
-        }
-
         const createdJobIds = [];
-        const audioFiles = req.files['audio'];
-        if (!audioFiles || audioFiles.length === 0) return res.status(400).send('缺少音訊檔案');
 
-        audioFiles.forEach((audioFile, index) => {
-            const jobId = `job_${Date.now()}_${index + 1}`;
-            const titleWithIndex = audioFiles.length > 1 ? `${ytTitle} (${index + 1}/${audioFiles.length})` : ytTitle;
+        if (sourceType === 'youtube') {
+            const resolvedAudioUrl = req.body.resolvedAudioUrl;
+            const startTime = req.body.startTime || '00:00:00';
+            const endTime = req.body.endTime || '00:05:00';
 
-            updateJob(jobId, { status: 'queued', progress: '排隊中...', fileName: audioFile.originalname, videoUrl: null, error: null });
+            if (!resolvedAudioUrl) return res.status(400).send('缺少解析後的音訊串流網址');
+
+            const jobId = `job_${Date.now()}_yt`;
+            updateJob(jobId, { status: 'queued', progress: '排隊中...', fileName: `YouTube 音訊區間 (${startTime} ~ ${endTime})`, videoUrl: null, error: null });
             createdJobIds.push(jobId);
 
             queue.push({
-                jobId, imageFile, audioFile,
-                accessToken, ytTitle: titleWithIndex, ytDescription, ytPrivacy
+                jobId, imageFile, sourceType: 'youtube', resolvedAudioUrl, startTime, endTime,
+                accessToken, ytTitle, ytDescription, ytPrivacy
             });
-        });
+
+        } else {
+            const audioFiles = req.files['audio'];
+            if (!audioFiles || audioFiles.length === 0) return res.status(400).send('缺少音訊檔案');
+
+            audioFiles.forEach((audioFile, index) => {
+                const jobId = `job_${Date.now()}_${index + 1}`;
+                const titleWithIndex = audioFiles.length > 1 ? `${ytTitle} (${index + 1}/${audioFiles.length})` : ytTitle;
+
+                updateJob(jobId, { status: 'queued', progress: '排隊中...', fileName: audioFile.originalname, videoUrl: null, error: null });
+                createdJobIds.push(jobId);
+
+                queue.push({
+                    jobId, imageFile, sourceType: 'file', audioFile,
+                    accessToken, ytTitle: titleWithIndex, ytDescription, ytPrivacy
+                });
+            });
+        }
 
         res.json({ success: true, jobIds: createdJobIds });
         processQueue();
@@ -142,33 +157,59 @@ app.get('/status/batch', (req, res) => {
 });
 
 async function runAudioCoreJob(task, next) {
-    const { jobId, imageFile, audioFile, accessToken, ytTitle, ytDescription, ytPrivacy } = task;
+    const { jobId, imageFile, sourceType, audioFile, resolvedAudioUrl, startTime, endTime, accessToken, ytTitle, ytDescription, ytPrivacy } = task;
 
     currentProcessingJobId = jobId;
-    console.log(`[任務開始] JobID: ${jobId}, 檔案: ${audioFile.originalname}`);
+    console.log(`[任務開始] JobID: ${jobId}, 模式: ${sourceType}`);
     updateJob(jobId, { status: 'processing', progress: '00:00:00 (壓碼中)' });
 
     const tempMp4Path = path.join(uploadDir, `upload_${jobId}.mp4`);
-    let command = ffmpeg();
-    activeCommand = command;
 
-    command
-        .input(imageFile.path)
-        .inputOptions(['-loop 1'])
-        .input(audioFile.path)
-        .videoCodec('libx264')
-        .size('480x270')
-        .fps(1)
-        .outputOptions(['-preset ultrafast', '-tune stillimage', '-pix_fmt yuv420p', '-shortest', '-threads 1'])
-        .audioCodec('aac')
-        .audioBitrate('128k')
-        .output(tempMp4Path)
-        .on('progress', (p) => {
-            if (p.timemark) updateJob(jobId, { progress: `${p.timemark} (壓碼中)` });
-        })
-        .on('end', () => startYoutubeUpload(jobId, accessToken, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next))
-        .on('error', (err) => handleFfmpegError(err, jobId, audioFile, tempMp4Path, next))
-        .run();
+    if (sourceType === 'youtube') {
+        let command = ffmpeg();
+        activeCommand = command;
+
+        command
+            .input(imageFile.path)
+            .inputOptions(['-loop 1'])
+            .input(resolvedAudioUrl)
+            .inputOptions([`-ss ${startTime}`, `-to ${endTime}`])
+            .videoCodec('libx264')
+            .size('480x270')
+            .fps(1)
+            .outputOptions(['-preset ultrafast', '-tune stillimage', '-pix_fmt yuv420p', '-threads 1'])
+            .audioCodec('aac')
+            .audioBitrate('128k')
+            .output(tempMp4Path)
+            .on('progress', (p) => {
+                if (p.timemark) updateJob(jobId, { progress: `${p.timemark} (壓碼中)` });
+            })
+            .on('end', () => startYoutubeUpload(jobId, accessToken, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next))
+            .on('error', (err) => handleFfmpegError(err, jobId, audioFile, tempMp4Path, next))
+            .run();
+
+    } else {
+        let command = ffmpeg();
+        activeCommand = command;
+
+        command
+            .input(imageFile.path)
+            .inputOptions(['-loop 1'])
+            .input(audioFile.path)
+            .videoCodec('libx264')
+            .size('480x270')
+            .fps(1)
+            .outputOptions(['-preset ultrafast', '-tune stillimage', '-pix_fmt yuv420p', '-shortest', '-threads 1'])
+            .audioCodec('aac')
+            .audioBitrate('128k')
+            .output(tempMp4Path)
+            .on('progress', (p) => {
+                if (p.timemark) updateJob(jobId, { progress: `${p.timemark} (壓碼中)` });
+            })
+            .on('end', () => startYoutubeUpload(jobId, accessToken, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next))
+            .on('error', (err) => handleFfmpegError(err, jobId, audioFile, tempMp4Path, next))
+            .run();
+    }
 }
 
 async function startYoutubeUpload(jobId, accessToken, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next) {
