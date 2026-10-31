@@ -56,7 +56,6 @@ function processQueue() {
         return processQueue();
     }
 
-    // 啟動非同步轉碼任務，不卡住 HTTP 回應
     runAudioCoreJob(task, () => {
         isProcessing = false;
         activeCommand = null;
@@ -65,6 +64,7 @@ function processQueue() {
     });
 }
 
+// 產生帶有 offline access 的授權網址 (取得長效 Refresh Token)
 app.get('/auth/url', (req, res) => {
     const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
     const authUrl = oauth2Client.generateAuthUrl({
@@ -75,12 +75,43 @@ app.get('/auth/url', (req, res) => {
     res.json({ url: authUrl });
 });
 
+// OAuth Callback 處理 Code 換 Access & Refresh Token
+app.get('/auth/callback', async (req, res) => {
+    const code = req.query.code;
+    if (!code) return res.status(400).send('缺少授權碼 Code');
+
+    try {
+        const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
+        const { tokens } = await oauth2Client.getToken(code);
+        
+        // 將 Token 回傳給前端儲存
+        res.send(`
+            <script>
+                if (window.opener) {
+                    window.opener.postMessage({ type: 'OAUTH_TOKENS', tokens: ${JSON.stringify(tokens)} }, '*');
+                    window.close();
+                } else {
+                    document.write("授權成功！請關閉此視窗返回主頁面。");
+                }
+            </script>
+        `);
+    } catch (e) {
+        console.error('Callback error:', e);
+        res.status(500).send('授權失敗：' + e.message);
+    }
+});
+
 app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 10 }]), (req, res) => {
     try {
         if (!req.files || !req.files['image']) return res.status(400).send('缺少靜態圖片檔案');
 
-        const accessToken = req.body.accessToken;
-        if (!accessToken) return res.status(400).send('未提供有效的 YouTube 授權 Token');
+        const tokensRaw = req.body.tokens;
+        if (!tokensRaw) return res.status(400).send('未提供有效的 YouTube 授權 Token，請重新點擊授權');
+
+        let tokens;
+        try { tokens = typeof tokensRaw === 'string' ? JSON.parse(tokensRaw) : tokensRaw; } catch (e) {
+            tokens = { access_token: tokensRaw };
+        }
 
         const imageFile = req.files['image'][0];
         const ytTitle = req.body.title || 'My Audio Track';
@@ -100,14 +131,12 @@ app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'aud
 
             queue.push({
                 jobId, imageFile, audioFile,
-                accessToken, ytTitle: titleWithIndex, ytDescription, ytPrivacy
+                tokens, ytTitle: titleWithIndex, ytDescription, ytPrivacy
             });
         });
 
-        // 立刻回應前端取得 Job ID，釋放 HTTP 連線，防 Timeout
+        // 立即回應，不卡住連線
         res.json({ success: true, jobIds: createdJobIds });
-        
-        // 觸發背景處理佇列
         processQueue();
 
     } catch (err) {
@@ -141,7 +170,7 @@ app.get('/status/batch', (req, res) => {
 });
 
 async function runAudioCoreJob(task, next) {
-    const { jobId, imageFile, audioFile, accessToken, ytTitle, ytDescription, ytPrivacy } = task;
+    const { jobId, imageFile, audioFile, tokens, ytTitle, ytDescription, ytPrivacy } = task;
 
     currentProcessingJobId = jobId;
     console.log(`[任務開始] JobID: ${jobId}, 檔案: ${audioFile.originalname}`);
@@ -156,14 +185,14 @@ async function runAudioCoreJob(task, next) {
         .inputOptions(['-loop 1'])
         .input(audioFile.path)
         .videoCodec('libx264')
-        .size('428x240') // 降至 240p，節省 80% 計算時間
-        .fps(1)          // 1 fps 靜態封面極速轉換
+        .size('428x240')
+        .fps(1)
         .outputOptions([
-            '-preset ultrafast', // 最速編碼
+            '-preset ultrafast',
             '-tune stillimage',
             '-pix_fmt yuv420p',
             '-shortest',
-            '-threads 2'         // 充分利用 Render CPU 執行緒
+            '-threads 2'
         ])
         .audioCodec('aac')
         .audioBitrate('128k')
@@ -171,12 +200,12 @@ async function runAudioCoreJob(task, next) {
         .on('progress', (p) => {
             if (p.timemark) updateJob(jobId, { progress: `${p.timemark} (極速壓碼中)` });
         })
-        .on('end', () => startYoutubeUpload(jobId, accessToken, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next))
+        .on('end', () => startYoutubeUpload(jobId, tokens, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next))
         .on('error', (err) => handleFfmpegError(err, jobId, audioFile, tempMp4Path, next))
         .run();
 }
 
-async function startYoutubeUpload(jobId, accessToken, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next) {
+async function startYoutubeUpload(jobId, tokens, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next) {
     const jobs = getJobs();
     if (jobs[jobId] && jobs[jobId].status === 'cancelled') {
         cleanupFiles(audioFile ? audioFile.path : null, tempMp4Path);
@@ -188,7 +217,18 @@ async function startYoutubeUpload(jobId, accessToken, tempMp4Path, ytTitle, ytDe
 
     try {
         const auth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-        auth.setCredentials({ access_token: accessToken });
+        auth.setCredentials(tokens);
+
+        // 如果 Access Token 過期，自動向 Google 換取新的 Token
+        if (tokens.refresh_token) {
+            try {
+                const newTokens = await auth.refreshAccessToken();
+                auth.setCredentials(newTokens.credentials);
+            } catch (e) {
+                console.warn('Refresh token failed, using existing tokens:', e.message);
+            }
+        }
+
         const youtube = google.youtube({ version: 'v3', auth: auth });
 
         const res = await youtube.videos.insert({
