@@ -64,7 +64,7 @@ function processQueue() {
     });
 }
 
-// 產生帶有 offline access 的授權網址 (取得長效 Refresh Token)
+// 產生帶有 offline access 的長效授權網址
 app.get('/auth/url', (req, res) => {
     const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
     const authUrl = oauth2Client.generateAuthUrl({
@@ -75,7 +75,7 @@ app.get('/auth/url', (req, res) => {
     res.json({ url: authUrl });
 });
 
-// OAuth Callback 處理 Code 換 Access & Refresh Token
+// OAuth Callback 處理視窗
 app.get('/auth/callback', async (req, res) => {
     const code = req.query.code;
     if (!code) return res.status(400).send('缺少授權碼 Code');
@@ -84,7 +84,6 @@ app.get('/auth/callback', async (req, res) => {
         const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
         const { tokens } = await oauth2Client.getToken(code);
         
-        // 將 Token 回傳給前端儲存
         res.send(`
             <script>
                 if (window.opener) {
@@ -135,7 +134,7 @@ app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'aud
             });
         });
 
-        // 立即回應，不卡住連線
+        // 接收完成後立刻回應 HTTP，釋放手機端連線
         res.json({ success: true, jobIds: createdJobIds });
         processQueue();
 
@@ -185,8 +184,8 @@ async function runAudioCoreJob(task, next) {
         .inputOptions(['-loop 1'])
         .input(audioFile.path)
         .videoCodec('libx264')
-        .size('428x240')
-        .fps(1)
+        .size('428x240') // 240p 省時 80%
+        .fps(1)          // 1 fps 靜態封面極速壓碼
         .outputOptions([
             '-preset ultrafast',
             '-tune stillimage',
@@ -219,7 +218,7 @@ async function startYoutubeUpload(jobId, tokens, tempMp4Path, ytTitle, ytDescrip
         const auth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
         auth.setCredentials(tokens);
 
-        // 如果 Access Token 過期，自動向 Google 換取新的 Token
+        // 長效 Token 自動續約機制
         if (tokens.refresh_token) {
             try {
                 const newTokens = await auth.refreshAccessToken();
