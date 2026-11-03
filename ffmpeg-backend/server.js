@@ -64,7 +64,6 @@ function processQueue() {
     });
 }
 
-// 產生帶有 offline access 的長效授權網址
 app.get('/auth/url', (req, res) => {
     const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
     const authUrl = oauth2Client.generateAuthUrl({
@@ -75,7 +74,6 @@ app.get('/auth/url', (req, res) => {
     res.json({ url: authUrl });
 });
 
-// OAuth Callback 處理視窗
 app.get('/auth/callback', async (req, res) => {
     const code = req.query.code;
     if (!code) return res.status(400).send('缺少授權碼 Code');
@@ -134,7 +132,6 @@ app.post('/convert', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'aud
             });
         });
 
-        // 接收完成後立刻回應 HTTP，釋放手機端連線
         res.json({ success: true, jobIds: createdJobIds });
         processQueue();
 
@@ -173,7 +170,7 @@ async function runAudioCoreJob(task, next) {
 
     currentProcessingJobId = jobId;
     console.log(`[任務開始] JobID: ${jobId}, 檔案: ${audioFile.originalname}`);
-    updateJob(jobId, { status: 'processing', progress: '00:00:00 (極速壓碼中)' });
+    updateJob(jobId, { status: 'processing', progress: '00:00:00 (省記憶體壓碼中)' });
 
     const tempMp4Path = path.join(uploadDir, `upload_${jobId}.mp4`);
     let command = ffmpeg();
@@ -184,20 +181,21 @@ async function runAudioCoreJob(task, next) {
         .inputOptions(['-loop 1'])
         .input(audioFile.path)
         .videoCodec('libx264')
-        .size('428x240') // 240p 省時 80%
-        .fps(1)          // 1 fps 靜態封面極速壓碼
+        .size('320x180') // 極小解析度，記憶體佔用降低 90%
+        .fps(1)          // 1 fps 靜態圖片
         .outputOptions([
             '-preset ultrafast',
             '-tune stillimage',
             '-pix_fmt yuv420p',
             '-shortest',
-            '-threads 2'
+            '-threads 1',      // 限制單執行緒，防止記憶體衝高
+            '-max_muxing_queue_size 1024'
         ])
         .audioCodec('aac')
-        .audioBitrate('128k')
+        .audioBitrate('96k')   // 降低音訊編碼緩衝
         .output(tempMp4Path)
         .on('progress', (p) => {
-            if (p.timemark) updateJob(jobId, { progress: `${p.timemark} (極速壓碼中)` });
+            if (p.timemark) updateJob(jobId, { progress: `${p.timemark} (壓碼中)` });
         })
         .on('end', () => startYoutubeUpload(jobId, tokens, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next))
         .on('error', (err) => handleFfmpegError(err, jobId, audioFile, tempMp4Path, next))
@@ -218,13 +216,12 @@ async function startYoutubeUpload(jobId, tokens, tempMp4Path, ytTitle, ytDescrip
         const auth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
         auth.setCredentials(tokens);
 
-        // 長效 Token 自動續約機制
         if (tokens.refresh_token) {
             try {
                 const newTokens = await auth.refreshAccessToken();
                 auth.setCredentials(newTokens.credentials);
             } catch (e) {
-                console.warn('Refresh token failed, using existing tokens:', e.message);
+                console.warn('Refresh token failed:', e.message);
             }
         }
 
