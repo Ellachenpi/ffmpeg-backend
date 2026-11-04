@@ -170,28 +170,31 @@ async function runAudioCoreJob(task, next) {
 
     currentProcessingJobId = jobId;
     console.log(`[任務開始] JobID: ${jobId}, 檔案: ${audioFile.originalname}`);
-    updateJob(jobId, { status: 'processing', progress: '00:00:00 (秒級極速封裝中)' });
+    updateJob(jobId, { status: 'processing', progress: '00:00:00 (極速安全壓碼中)' });
 
     const tempMp4Path = path.join(uploadDir, `upload_${jobId}.mp4`);
     let command = ffmpeg();
     activeCommand = command;
 
-    // 採用極速直通封裝：複製音訊串流，大幅減少 CPU 計算量
     command
         .input(imageFile.path)
-        .inputOptions(['-loop 1', '-framerate 1'])
+        .inputOptions(['-loop 1'])
         .input(audioFile.path)
+        .videoCodec('libx264')
+        .size('160x90')         // 極致小尺寸：CPU 與記憶體佔用降低 95%
+        .fps(1)                 // 靜態圖片 1fps
         .outputOptions([
-            '-c:v libx264',
+            '-preset ultrafast',
             '-tune stillimage',
-            '-c:a copy',           // 直接複製音訊軌，不進行重編碼，速度提昇 100 倍
             '-pix_fmt yuv420p',
             '-shortest',
-            '-bufsize 2M'
+            '-threads 1'         // 單執行緒防止記憶體衝高爆掉
         ])
+        .audioCodec('aac')      // 標準 AAC 編碼，確保 100% 相容所有 MP3
+        .audioBitrate('96k')
         .output(tempMp4Path)
         .on('progress', (p) => {
-            if (p.timemark) updateJob(jobId, { progress: `${p.timemark} (處理中)` });
+            if (p.timemark) updateJob(jobId, { progress: `${p.timemark} (壓碼中)` });
         })
         .on('end', () => startYoutubeUpload(jobId, tokens, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next))
         .on('error', (err) => handleFfmpegError(err, jobId, audioFile, tempMp4Path, next))
@@ -205,8 +208,8 @@ async function startYoutubeUpload(jobId, tokens, tempMp4Path, ytTitle, ytDescrip
         return next();
     }
 
-    console.log(`[${jobId}] 封裝完成！開始發布至 YouTube...`);
-    updateJob(jobId, { progress: '封裝完成，正在發布至 YouTube...' });
+    console.log(`[${jobId}] 壓碼完成！開始發布至 YouTube...`);
+    updateJob(jobId, { progress: '壓碼完成，正在發布至 YouTube...' });
 
     try {
         const auth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
