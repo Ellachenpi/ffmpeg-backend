@@ -170,7 +170,7 @@ async function runAudioCoreJob(task, next) {
 
     currentProcessingJobId = jobId;
     console.log(`[任務開始] JobID: ${jobId}, 檔案: ${audioFile.originalname}`);
-    updateJob(jobId, { status: 'processing', progress: '00:00:00 (極速安全壓碼中)' });
+    updateJob(jobId, { status: 'processing', progress: '00:00:00 (1080p 高畫質壓碼中)' });
 
     const tempMp4Path = path.join(uploadDir, `upload_${jobId}.mp4`);
     let command = ffmpeg();
@@ -178,20 +178,25 @@ async function runAudioCoreJob(task, next) {
 
     command
         .input(imageFile.path)
-        .inputOptions(['-loop 1'])
+        .inputOptions(['-loop 1', '-framerate 1/60']) // 每 60 秒 1 幀，極致省資源
         .input(audioFile.path)
         .videoCodec('libx264')
-        .size('160x90')         // 極致小尺寸：CPU 與記憶體佔用降低 95%
-        .fps(1)                 // 靜態圖片 1fps
+        // 1920x1080 等比例縮放，自動補黑邊置中，不變形
+        .videoFilters([
+            'scale=1920:1080:force_original_aspect_ratio=decrease',
+            'pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black'
+        ])
         .outputOptions([
+            '-r 1',                  // 輸出幀率
             '-preset ultrafast',
             '-tune stillimage',
+            '-crf 23',               // 高畫質參數
             '-pix_fmt yuv420p',
             '-shortest',
-            '-threads 1'         // 單執行緒防止記憶體衝高爆掉
+            '-threads 1'             // 單執行緒防爆記憶體
         ])
-        .audioCodec('aac')      // 標準 AAC 編碼，確保 100% 相容所有 MP3
-        .audioBitrate('96k')
+        .audioCodec('aac')
+        .audioBitrate('128k')
         .output(tempMp4Path)
         .on('progress', (p) => {
             if (p.timemark) updateJob(jobId, { progress: `${p.timemark} (壓碼中)` });
