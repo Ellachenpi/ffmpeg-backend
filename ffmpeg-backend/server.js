@@ -176,9 +176,9 @@ async function runAudioCoreJob(task, next) {
     let command = ffmpeg();
     activeCommand = command;
 
-    command
+command
         .input(imageFile.path)
-        .inputOptions(['-loop 1', '-framerate 1/60']) // 每 60 秒 1 幀，極致省資源
+        .inputOptions(['-loop 1', '-framerate 1/1800']) // 每 1800 秒（30 分鐘）1 幀
         .input(audioFile.path)
         .videoCodec('libx264')
         // 1920x1080 等比例縮放，自動補黑邊置中，不變形
