@@ -30,16 +30,6 @@ function updateJob(jobId, data) {
     fs.writeFileSync(jobsFilePath, JSON.stringify(jobs, null, 2));
 }
 
-function getAudioDurationSec(filePath) {
-    return new Promise((resolve) => {
-        ffmpeg.ffprobe(filePath, (err, metadata) => {
-            if (err || !metadata || !metadata.format) return resolve(null);
-            const dur = Number(metadata.format.duration);
-            resolve(Number.isFinite(dur) ? dur : null);
-        });
-    });
-}
-
 const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, uploadDir),
     filename: (req, file, cb) => {
@@ -179,11 +169,8 @@ async function runAudioCoreJob(task, next) {
     const { jobId, imageFile, audioFile, tokens, ytTitle, ytDescription, ytPrivacy } = task;
 
     currentProcessingJobId = jobId;
-    const durationSec = await getAudioDurationSec(audioFile.path);
-    const durationText = durationSec ? `${Math.floor(durationSec / 60)}m${Math.round(durationSec % 60)}s` : '未知';
-
-    console.log(`[任務開始] JobID: ${jobId}, 檔案: ${audioFile.originalname}, 音訊時長: ${durationText}`);
-    updateJob(jobId, { status: 'processing', progress: `00:00:00 / ${durationText} (1080p 壓碼中)` });
+    console.log(`[任務開始] JobID: ${jobId}, 檔案: ${audioFile.originalname}`);
+    updateJob(jobId, { status: 'processing', progress: '00:00:00 (1080p 高畫質壓碼中)' });
 
     const tempMp4Path = path.join(uploadDir, `upload_${jobId}.mp4`);
     let command = ffmpeg();
@@ -194,4 +181,95 @@ async function runAudioCoreJob(task, next) {
         .inputOptions(['-loop 1', '-framerate 1/30']) // 每 30 秒 1 幀
         .input(audioFile.path)
         .videoCodec('libx264')
-        // 1920x1080 等
+        // 1920x1080 等比例縮放，自動補黑邊置中，不變形
+        .videoFilters([
+            'scale=1920:1080:force_original_aspect_ratio=decrease',
+            'pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black'
+        ])
+        .outputOptions([
+            '-r 1/30',               // 輸出每 30 秒 1 幀
+            '-preset ultrafast',
+            '-tune stillimage',
+            '-crf 23',               // 高畫質參數
+            '-pix_fmt yuv420p',
+            '-shortest',             // 隨音檔結束而停止
+            '-threads 1'             // 單執行緒防爆記憶體
+        ])
+        .audioCodec('aac')
+        .audioBitrate('128k')
+        .output(tempMp4Path)
+        .on('progress', (p) => {
+            if (p.timemark) updateJob(jobId, { progress: `${p.timemark} (壓碼中)` });
+        })
+        .on('end', () => startYoutubeUpload(jobId, tokens, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next))
+        .on('error', (err) => handleFfmpegError(err, jobId, audioFile, tempMp4Path, next))
+        .run();
+}
+
+async function startYoutubeUpload(jobId, tokens, tempMp4Path, ytTitle, ytDescription, ytPrivacy, audioFile, next) {
+    const jobs = getJobs();
+    if (jobs[jobId] && jobs[jobId].status === 'cancelled') {
+        cleanupFiles(audioFile ? audioFile.path : null, tempMp4Path);
+        return next();
+    }
+
+    console.log(`[${jobId}] 壓碼完成！開始發布至 YouTube...`);
+    updateJob(jobId, { progress: '壓碼完成，正在發布至 YouTube...' });
+
+    try {
+        const auth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
+        auth.setCredentials(tokens);
+
+        if (tokens.refresh_token) {
+            try {
+                const newTokens = await auth.refreshAccessToken();
+                auth.setCredentials(newTokens.credentials);
+            } catch (e) {
+                console.warn('Refresh token failed:', e.message);
+            }
+        }
+
+        const youtube = google.youtube({ version: 'v3', auth: auth });
+
+        const res = await youtube.videos.insert({
+            part: ['snippet', 'status'],
+            requestBody: {
+                snippet: { title: ytTitle, description: ytDescription, categoryId: '10' },
+                status: { privacyStatus: ytPrivacy }
+            },
+            media: {
+                body: fs.createReadStream(tempMp4Path)
+            }
+        });
+
+        console.log(`[${jobId} 上傳成功] Video ID: ${res.data.id}`);
+        updateJob(jobId, { status: 'completed', videoUrl: `https://youtu.be/${res.data.id}` });
+
+    } catch (ytErr) {
+        console.error(`[${jobId} 上傳失敗]:`, ytErr);
+        updateJob(jobId, { status: 'error', error: 'YouTube 上傳失敗：' + (ytErr.message || '授權失效') });
+    } finally {
+        cleanupFiles(audioFile ? audioFile.path : null, tempMp4Path);
+        next();
+    }
+}
+
+function handleFfmpegError(err, jobId, audioFile, tempMp4Path, next) {
+    const jobs = getJobs();
+    if (jobs[jobId] && jobs[jobId].status === 'cancelled') {
+        console.log(`[${jobId}] 任務已手動中止`);
+    } else {
+        console.error(`[${jobId} FFmpeg 錯誤]:`, err);
+        updateJob(jobId, { status: 'error', error: '音訊處理失敗：' + err.message });
+    }
+    cleanupFiles(audioFile ? audioFile.path : null, tempMp4Path);
+    next();
+}
+
+function cleanupFiles(audioPath, mp4Path) {
+    if (audioPath && fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+    if (mp4Path && fs.existsSync(mp4Path)) fs.unlinkSync(mp4Path);
+}
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
