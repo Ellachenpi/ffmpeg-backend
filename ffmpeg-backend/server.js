@@ -178,7 +178,7 @@ async function runAudioCoreJob(task, next) {
 
     command
         .input(imageFile.path)
-        .inputOptions(['-loop 1', '-framerate 1/30']) // 每 30 秒 1 幀
+        .inputOptions(['-loop 1', '-framerate 1/30']) // 每 30 秒 1 幀讀取圖片
         .input(audioFile.path)
         .videoCodec('libx264')
         // 1920x1080 等比例縮放，自動補黑邊置中，不變形
@@ -187,7 +187,8 @@ async function runAudioCoreJob(task, next) {
             'pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black'
         ])
         .outputOptions([
-            '-r 1/30',               // 輸出每 30 秒 1 幀
+            '-r 1',                  // 輸出 1 FPS，避免 1/30 造成的 30 秒邊界湊整
+            '-vsync', 'cfr',         // 固定幀率對齊音訊時間戳
             '-preset ultrafast',
             '-tune stillimage',
             '-crf 23',               // 高畫質參數
